@@ -10,7 +10,7 @@ BASE_URL="https://raw.githubusercontent.com/ctrlpi/pi-gpio-api/main"
 
 
 
-FILES="main.py requirements.txt run.sh install.sh LICENSE README.md"
+FILES="main.py lite.py requirements.txt run.sh install.sh LICENSE README.md"
 DIR="pi-gpio-api"
 SHELLS=(bash sh dash zsh ksh ash)
 
@@ -20,9 +20,13 @@ for s in "${SHELLS[@]}"; do
   [ "$RUN_AS" = "$s" ] && DOWNLOAD=true
 done
 ASSUME_YES=false
+LITE=false
+FULL=false
 for arg in "$@"; do
   [ "$arg" = "--upgrade" ] && DOWNLOAD=true
   [ "$arg" = "-y" ] && ASSUME_YES=true
+  [ "$arg" = "--lite" ] && LITE=true
+  [ "$arg" = "--full" ] && FULL=true
 done
 
 if [ "$DOWNLOAD" = true ] && ! command -v curl >/dev/null 2>&1; then
@@ -76,10 +80,22 @@ DEFAULT_NAME="${DEFAULT_NAME%.local}"   # macOS hostnames are "Name.local"; no-o
 
 ask() {
   local ans=""
+  if [ "$ASSUME_YES" = true ]; then
+    printf '%s' "$2"
+    return
+  fi
+  # If stdin is not a terminal and we are not in curl-pipe mode, read from stdin
+  if [ ! -t 0 ] && [ "$DOWNLOAD" != true ]; then
+    read -r ans 2>/dev/null || ans=""
+    printf '%s' "${ans:-$2}"
+    return
+  fi
   # Probe /dev/tty quietly first, so a failure (no controlling terminal, e.g. CI)
   # doesn't also swallow the real read's prompt.
-  if [ "$ASSUME_YES" != true ] && { : < /dev/tty; } 2>/dev/null; then
+  if { : < /dev/tty; } 2>/dev/null; then
     read -r -p "$1 [$2]: " ans < /dev/tty || ans=""
+  elif [ -t 0 ]; then
+    read -r -p "$1 [$2]: " ans || ans=""
   fi
   printf '%s' "${ans:-$2}"
 }
@@ -92,6 +108,31 @@ if [ ! -f "$CONFIG_FILE" ]; then
   echo "Saved $CONFIG_FILE - API key '$API_KEY', name '$AGENT_NAME'."
 fi
 
+# Prompt for Lite vs Full package if neither --lite nor --full was passed.
+if [ "$LITE" != true ] && [ "$FULL" != true ]; then
+  echo ""
+  echo "pi-gpio-api is available in Lite and Full packages:"
+  echo "  - Lite (recommended): lightweight socket server, fast startup, zero"
+  echo "    fastapi/pydantic dependencies. Recommended unless you want the interactive"
+  echo "    FastAPI /docs pages. Older Raspberry Pi models struggle with the heavy"
+  echo "    dependencies and are much better running the lite version."
+  echo "  - Full: includes FastAPI, Pydantic, and Uvicorn for interactive /docs pages."
+  echo ""
+  DEFAULT_CHOICE="Y"
+  if [ -x "$DIR/venv/bin/python" ] && "$DIR/venv/bin/python" -c "import fastapi" 2>/dev/null; then
+    DEFAULT_CHOICE="n"
+  fi
+  CHOICE="$(ask "Install the lite version? (Y/n)" "$DEFAULT_CHOICE")"
+  case "$CHOICE" in
+    [nN]|[nN][oO])
+      LITE=false
+      ;;
+    *)
+      LITE=true
+      ;;
+  esac
+fi
+
 # Create scripts folder and seed one example (does not overwrite).
 SCRIPTS_DIR="$DIR/scripts"
 mkdir -p "$SCRIPTS_DIR"
@@ -102,6 +143,7 @@ if [ ! -f "$SCRIPTS_DIR/cpu-temp.sh" ]; then
 # Use it as a sensor: POST /sensor/config/cpu_temp {"script": "cpu-temp.sh"}
 awk '{ printf "%.1f\n", $1/1000 }' /sys/class/thermal/thermal_zone0/temp
 SCRIPT
+  chmod +x "$SCRIPTS_DIR/cpu-temp.sh"
   echo "Created $SCRIPTS_DIR/cpu-temp.sh - configure it with {\"script\": \"cpu-temp.sh\"}"
 fi
 
@@ -120,9 +162,18 @@ if ! "$VENV_DIR/bin/python" -c '' 2>/dev/null; then
   echo "  ./install.sh" >&2
   exit 1
 fi
-echo "Installing dependencies..."
+if [ "$LITE" = true ]; then
+  echo "Installing dependencies (Lite package)..."
+  "$VENV_DIR/bin/python" -m pip uninstall -y fastapi pydantic uvicorn >/dev/null 2>&1 || true
+else
+  echo "Installing dependencies (Full package)..."
+fi
 # gpiozero is Pi-only; on non-Pi machines main.py uses mock GPIO classes,
 # so skip it here without touching requirements.txt.
+FILTER_EXPR='^$'
+if [ "$LITE" = true ]; then
+  FILTER_EXPR='^(fastapi|pydantic|uvicorn)$'
+fi
 if grep -qi raspberry /proc/device-tree/model 2>/dev/null; then
   # Verify apt-installed GPIO backend (python3-lgpio or python3-rpi.gpio).
   if ! python3 -c "import lgpio" 2>/dev/null && ! python3 -c "import RPi.GPIO" 2>/dev/null; then
@@ -132,12 +183,21 @@ if grep -qi raspberry /proc/device-tree/model 2>/dev/null; then
     echo "  ./install.sh" >&2
     exit 1
   fi
-  "$VENV_DIR/bin/python" -m pip install --quiet -r "$DIR/requirements.txt"
+  if [ "$LITE" = true ]; then
+    grep -viE "$FILTER_EXPR" "$DIR/requirements.txt" | "$VENV_DIR/bin/python" -m pip install --quiet -r /dev/stdin
+  else
+    "$VENV_DIR/bin/python" -m pip install -q -r "$DIR/requirements.txt"
+  fi
 else
   echo "Not a Raspberry Pi - skipping gpiozero."
-  grep -viE '^gpiozero$' "$DIR/requirements.txt" | "$VENV_DIR/bin/python" -m pip install --quiet -r /dev/stdin
+  FILTER_EXPR='^gpiozero$'
+  if [ "$LITE" = true ]; then
+    FILTER_EXPR='^(gpiozero|fastapi|pydantic|uvicorn)$'
+  fi
+  grep -viE "$FILTER_EXPR" "$DIR/requirements.txt" | "$VENV_DIR/bin/python" -m pip install --quiet -r /dev/stdin
 fi
 
+chmod +x "$DIR/run.sh"
 echo "Done."
 
 # Print systemd instructions on Raspberry Pi.
@@ -178,5 +238,10 @@ sudo systemctl daemon-reload && sudo systemctl enable --now pi-gpio-api
 EOF
     echo "------------------------------------------------------------------------"
   fi
+else
+  RUN_SH_PATH="$(cd "$DIR" && pwd)/run.sh"
+  echo ""
+  echo "To start the server, run:"
+  echo "  $RUN_SH_PATH"
 fi
 echo ""

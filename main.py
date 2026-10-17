@@ -41,7 +41,7 @@ except ModuleNotFoundError as e:
 
 from typing import Optional, Union, Literal, Dict, Any
 from contextlib import asynccontextmanager
-VERSION = "0.9.23"  # agent software version (kept in lockstep with pico-gpio-api); surfaced in /config/read
+VERSION = "0.9.26"  # agent software version (kept in lockstep with pico-gpio-api); surfaced in /config/read
 IS_PI = os.path.exists("/proc/device-tree/model")  # only real Pi hardware exposes this
 _PI_GPIO_PINS = [str(p) for p in range(2, 28)]  # usable BCM range (2-27)
 # GPIO 2 and 3 have fixed hardware pull-ups on all Pi boards.
@@ -222,10 +222,8 @@ def _serial4() -> str:
     return "0000"
 
 def _short_model() -> str:
-    """Condense the model to a short tag without the revision, for the fallback agent
-    name: 'Pi 4 B Rev 1.1' -> '4B', 'Pi Zero 2 W Rev 1.0' -> 'Zero2W'. _get_platform()
-    has already dropped Raspberry/Model, so this removes the leading 'Pi', the word 'Rev'
-    and the trailing revision number."""
+    """Short model tag for the fallback agent name: 'Pi 4 B Rev 1.1' -> '4B',
+    'Pi Zero 2 W Rev 1.0' -> 'Zero2W'."""
     parts = [w for w in _get_platform().split() if w.lower() != "rev"]
     if parts and parts[0].lower() == "pi":
         parts = parts[1:]
@@ -265,6 +263,9 @@ else:
 
 # --- Models ---
 
+# Text fields take a number as text (a key typed as 4242 is stored as "4242").
+_TEXT = ConfigDict(coerce_numbers_to_str=True)
+
 # Lowercase incoming strings so enum-like fields (type, pullup, value, ...) are case-insensitive
 def _norm_str(v):
     if not isinstance(v, str): return v
@@ -281,7 +282,7 @@ class WriteRequest(BaseModel):
 
 # Persisted per-pin settings; also the body for POST /gpio/config/{name_or_gpio}
 class PinConfig(BaseModel):
-    model_config = ConfigDict(validate_assignment=True)
+    model_config = ConfigDict(validate_assignment=True, coerce_numbers_to_str=True)
 
     name: Optional[str] = None
     type: Optional[Literal["input", "output", "vcc", "gnd", "remove"]] = None
@@ -336,30 +337,28 @@ class PinInfo(BaseModel):
 # A named sensor: runs a script from the agent's scripts/ folder and returns its
 # stdout. `script` is "<script-file> [args...]" (see _validate_sensor_script).
 class SensorConfig(BaseModel):
+    model_config = _TEXT
     script: Optional[str] = None
 
 # The general-purpose webhook target, grouped under config.notifications. `webhook_key`
 # is a key for the *target*, never the agent's own api_key, and is sent as the Api-Key
 # header only when set (see _notify_targets).
 class NotificationsConfig(BaseModel):
+    model_config = _TEXT
     webhook: Optional[str] = None
     webhook_key: Optional[str] = None
 
-# Callback URLs owned by the smart-home bridges, grouped under config.bridges. Each
-# bridge sets its own field rather than competing for the single notifications.webhook, and
-# every configured target gets the same notification (see _notify_targets). Each URL has
-# its own key, which the bridge generates fresh on every start and pushes here; the agent
-# sends it back as the Api-Key header so the bridge can tell a real event from a forged
-# one. Its own api_key is never sent to a bridge, same as notifications.webhook.
+# Callback URLs of the smart-home bridges, one field each, so no bridge competes for
+# notifications.webhook. Each has its own key, pushed by the bridge on every start and
+# sent back as the Api-Key header; the agent's own api_key is never sent.
 class BridgesConfig(BaseModel):
+    model_config = _TEXT
     matter: Optional[str] = None
     matter_key: Optional[str] = None
     homekit: Optional[str] = None
     homekit_key: Optional[str] = None
-    # homebridge-ctrlpi has its own field rather than sharing homekit's. Both put pins in
-    # the Home app, so a household may well run the standalone homekit-bridge and the
-    # Homebridge plugin at once; sharing one slot meant whichever configured itself last
-    # silently stopped the other receiving events.
+    # homebridge-ctrlpi has its own slot, so it and homekit-bridge both receive every
+    # event when a household runs both.
     homebridge: Optional[str] = None
     homebridge_key: Optional[str] = None
 
@@ -379,6 +378,7 @@ class SettingsUpdate(BaseModel):
 
 # Full persisted application config (config.json)
 class AppConfig(BaseModel):
+    model_config = _TEXT
     api_key: str
     name: Optional[str] = None
     notifications: NotificationsConfig = NotificationsConfig()
@@ -387,12 +387,10 @@ class AppConfig(BaseModel):
     sensors: Dict[str, SensorConfig] = {}
     gpios: Dict[str, PinConfig] = {}
 
-# Partial-update body for POST /config/update - every field is optional, only the ones
-# present get applied (see GPIOManager.set_app_config). Each group merges key by key, so
-# a bridge pushing its own URL never clears the other bridge's. Every grouped field may
-# also be sent at the **root** under its alias (see _ROOT_ALIASES) instead of inside its
-# group; both spellings are accepted on the same endpoint.
+# Partial-update body for POST /config/update: only fields present are applied, groups
+# merge key by key, and any grouped field may also be sent at the root (_ROOT_ALIASES).
 class ConfigUpdate(BaseModel):
+    model_config = _TEXT
     name: Optional[str] = None
     api_key: Optional[str] = None
     notifications: Optional[NotificationsConfig] = None
@@ -414,20 +412,17 @@ class ConfigUpdate(BaseModel):
 # Body for POST /sensor/config/{name}: a script to configure, or remove=true to
 # delete the sensor.
 class SensorConfigUpdate(BaseModel):
+    model_config = _TEXT
     script: Optional[str] = None
     remove: Optional[bool] = None
 
-# Keys a client may see but never set. `agent` is computed live on every read
-# (platform/os/ip/cpu_temperature/version), so it is dropped from whatever comes in
-# on /config/update and /config/load rather than being written to config.json - a
-# read-modify-load round trip would otherwise persist a stale snapshot of it.
+# Keys a client may see but never set: `agent` is computed live, so /config/update and
+# /config/load drop it instead of saving a stale snapshot.
 _READONLY_KEYS = ("agent",)
 
-# Root-level (ungrouped) spelling -> (group, field). A client may send either form on
-# /config/update and /config/load; _normalize_config() routes the root form into its
-# group so config.json is always written in the canonical grouped shape. The webhook
-# pair keeps its familiar `webhook_*` names rather than a bare `url`/`key`, which would
-# be ambiguous next to the agent's own api_key.
+# Root-level (ungrouped) spelling -> (group, field). Either form is accepted on
+# /config/update and /config/load; _normalize_config() folds the root form into its
+# group, so config.json is always grouped.
 _ROOT_ALIASES = {
     "webhook_url":  ("notifications", "webhook"),
     "webhook_key":  ("notifications", "webhook_key"),
@@ -452,20 +447,31 @@ def _normalize_config(data: dict) -> dict:
         target = out.setdefault(group, {})
         if isinstance(target, dict):
             target.setdefault(field, data[alias])
+    return _text_fields(out)
+
+# Keys, names, URLs and scripts are text: a number sent for one is stored as text
+# (4242 -> "4242"), so a key typed as digits never locks the agent.
+def _as_text(v):
+    return str(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else v
+
+def _text_fields(out):
+    for k in ("name", "api_key"):
+        if k in out:
+            out[k] = _as_text(out[k])
+    for group in ("notifications", "bridges"):
+        if isinstance(out.get(group), dict):
+            out[group] = {f: _as_text(v) for f, v in out[group].items()}
+    for section, field in (("gpios", "name"), ("sensors", "script")):
+        entries = out.get(section)
+        for entry in (entries.values() if isinstance(entries, dict) else ()):
+            if isinstance(entry, dict) and field in entry:
+                entry[field] = _as_text(entry[field])
     return out
 
 
 # --- Sensor script validation ---
-# A sensor may only run a script out of one hardcoded folder: `scripts/`, next to
-# main.py. The folder is fixed on purpose - there is no config field or API knob
-# to widen it - and the script is named by a BARE filename, so a remote API-key
-# holder can't reach anything outside that folder or turn sensors into an
-# arbitrary file-read or command-execution primitive. Validation runs both when a
-# sensor is configured (400 with the reason) and again on every read
-# ("blocked: <reason>"), because /config/load and a hand-edited config.json
-# bypass /sensor/config.
-# The folder isn't created here - staging scripts is the operator's job (install.sh
-# seeds it), and a missing folder simply means every sensor reads "script not found".
+# A bare filename from the fixed `scripts/` folder, so an API-key holder can't run or read
+# anything else. Checked on configure (400) and on every read ("blocked: <reason>").
 
 SENSOR_SCRIPTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripts")
 
@@ -563,30 +569,29 @@ def log_to_file(message: str):
             f.write(f"{ts} {message}\n")
 
 def _restart_process():
-    """Re-exec the current process in place (same PID, same argv/venv/cwd), which
-    re-reads config.json from scratch. Python 3.4+ opens sockets as
-    non-inheritable (PEP 446), so uvicorn's listening socket is closed by the
-    kernel during execv and the new process can rebind the port immediately -
-    no 'address already in use' race, no external supervisor needed."""
+    """Re-exec the process in place (same PID, argv, venv, cwd), re-reading config.json.
+    The listening socket is non-inheritable (PEP 446), so the new process can rebind
+    the port at once."""
     time.sleep(1.0)
     log_to_file("[CONFIG] Restarting process now")
     os.execv(sys.executable, [sys.executable] + sys.argv)
 
 def _reboot_device():
     """Reboots the physical device. Requires passwordless sudo for `reboot`
-    (e.g. a sudoers entry: `<user> ALL=(ALL) NOPASSWD: /sbin/reboot`)."""
+    (e.g. a sudoers entry: `<user> ALL=(ALL) NOPASSWD: /sbin/reboot`).
+    Falls back to a soft (in-process) restart if device reboot fails."""
     time.sleep(1.0)
     log_to_file("[CONFIG] Rebooting device now")
     try:
         subprocess.run(["sudo", "reboot"], check=True)
     except Exception as e:
-        log_to_file(f"[CONFIG] Reboot failed: {e}")
+        log_to_file(f"[CONFIG] Reboot failed: {e}; falling back to process restart")
+        _restart_process()
+
 
 def _upgrade_and_restart():
-    """Run install.sh --upgrade (re-downloads the release files and reinstalls
-    dependencies into the venv), then re-exec the process so the freshly-downloaded
-    code takes effect. Runs in a daemon thread so the /upgrade response can flush
-    first. If install.sh fails, the process is left running the current code."""
+    """Run install.sh --upgrade, then re-exec so the new code takes effect. On a daemon
+    thread so the response goes out first; if install.sh fails, the current code keeps running."""
     time.sleep(1.0)
     script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "install.sh")
     log_to_file("[CONFIG] Upgrade: running install.sh --upgrade")
@@ -606,15 +611,54 @@ def _upgrade_and_restart():
 
 # --- GPIO Manager ---
 
-# Serializes access to GPIOManager's shared state (devices/config/status). Route handlers
-# run in FastAPI's threadpool, and gpiozero edge callbacks and duration-revert timers
-# arrive on their own threads - without this, concurrent mutation of the dicts is a data
-# race. RLock because locked methods call each other (e.g. write_pin → _trigger_webhook).
+# Serializes GPIOManager's shared state across FastAPI's threadpool, gpiozero callbacks
+# and revert timers. RLock because locked methods call each other.
 def _locked(fn):
     def wrapper(self, *args, **kwargs):
         with self._lock:
             return fn(self, *args, **kwargs)
     return wrapper
+
+def _get_lan_ip() -> str:
+    # 1. Primary: UDP socket trick (fastest when default route exists)
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("8.8.8.8", 80))
+            ip = s.getsockname()[0]
+            if ip and not ip.startswith("127."):
+                return ip
+    except Exception:
+        pass
+
+    # 2. Backup: enumerate interfaces for offline machines / isolated LANs
+    try:
+        _, _, addrs = socket.gethostbyname_ex(socket.gethostname())
+        for a in addrs:
+            if not a.startswith("127.") and not a.startswith("169.254."):
+                return a
+    except Exception:
+        pass
+
+    try:
+        for res in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            ip = res[4][0]
+            if not ip.startswith("127.") and not ip.startswith("169.254."):
+                return ip
+    except Exception:
+        pass
+
+    for cmd in [["ip", "-4", "addr"], ["ifconfig"]]:
+        try:
+            out = subprocess.run(cmd, capture_output=True, text=True, timeout=2).stdout
+            for match in re.finditer(r"\binet\s+(\d+\.\d+\.\d+\.\d+)", out):
+                ip = match.group(1)
+                if not ip.startswith("127.") and not ip.startswith("169.254."):
+                    return ip
+        except Exception:
+            pass
+
+    return "127.0.0.1"
+
 
 class GPIOManager:
     def __init__(self):
@@ -633,8 +677,7 @@ class GPIOManager:
     def _build_config(self, data: dict) -> AppConfig:
         if "api_key" not in data:
             data["api_key"] = "your-secret-key"
-        # Migrate legacy pin configs that stored input/output as `init` values
-        # (e.g. init="input"/"clear"/"output") into the current type+init schema
+        # Convert an init of "input"/"clear"/"output" into type + init.
         for gpio, pin_data in data.get("gpios", {}).items():
             old_init = pin_data.get("init")
             if "type" not in pin_data or pin_data["type"] is None:
@@ -644,26 +687,19 @@ class GPIOManager:
                 elif old_init == "output":
                     pin_data["type"] = "output"
                     pin_data["init"] = None
-            # Drop what doesn't apply to the pin's type. config_pin() already does this,
-            # but /config/load and a hand-edited config.json write pins verbatim - and a
-            # pullup on a non-input, or watched:false, would then sit in /config/read
-            # while /gpio/read (which never shows either) disagreed.
-            # None, not a pop: PinConfig.pullup defaults to "up", so a removed key would
-            # just come back as the default and still show up in /config/read.
+            # Drop what doesn't apply to the pin's type: /config/load and a hand-edited
+            # config.json write pins verbatim. None, not a pop: PinConfig.pullup defaults
+            # to "up", so a removed key would come back.
             if _norm_str(pin_data.get("type")) in ("output", "vcc", "gnd"):
                 pin_data["pullup"] = None
-            # Same reasoning for a pull the board will not honour: _setup_input forces the
-            # hardware pull-up on GPIO 2/3 either way, so leaving the stored "down"/"none"
-            # in place would make /config/read and /gpio/read describe a pin that reads the
-            # opposite of what they claim.
+            # GPIO 2/3 always have the hardware pull-up, so a stored "down"/"none" would
+            # make /config/read and /gpio/read describe the opposite of the real reading.
             elif str(gpio) in _PI_FIXED_PULLUP_PINS and _norm_str(pin_data.get("pullup")) not in (None, "up"):
                 pin_data["pullup"] = "up"
             if pin_data.get("watched") is not True:
                 pin_data.pop("watched", None)
-        # Same idea for log_days: set_app_config() clamps it to 0-30 on /config/update,
-        # but /config/load and a hand-edited config.json write settings verbatim. Out of
-        # range it isn't just undocumented - a negative value puts the hourly cleanup's
-        # cutoff in the FUTURE, so every pass erases the entire log.
+        # Clamp log_days to 0-30 here too (/config/load and hand edits skip the API check):
+        # a negative value would make every hourly cleanup erase the whole log.
         settings = data.get("settings")
         if isinstance(settings, dict):
             try:
@@ -706,19 +742,14 @@ class GPIOManager:
         return {}
 
     def _save_status(self):
-        # Store the LOGICAL value (what /gpio/read reports), not the raw gpiozero one:
-        # for a pulled-up input those differ, so saving the raw value meant `init: "last"`
-        # compared a reference in one space against a reading in another. get_pin_info is
-        # the single definition of "the value", so this can't drift away from it.
+        # Store the logical value (what /gpio/read reports), not the raw gpiozero level,
+        # so `init: "last"` compares like with like. get_pin_info defines "the value".
         self.status = {g: self.get_pin_info(g)["value"] for g in list(self.devices)}
         _atomic_write_json(STATUS_FILE, self.status)
 
-    # Brings up the gpiozero device for a configured pin per its type/init/watch settings.
-    # Retries because claiming a GPIO can transiently fail (e.g. right after a previous close)
-    # `default_new_output_to_zero`: when type=output and no init (0/1/"last") is given, a pin
-    # that's newly becoming an output (wasn't one already) starts at LOW rather than undriven -
-    # set by config_pin() based on the pin's type just before this update was applied. A pin
-    # that was already an output keeps the old "leave it alone" behavior (initial_value=None).
+    # Brings up the gpiozero device for a pin per its type/init/watch settings, retrying
+    # briefly. `default_new_output_to_zero` (set by config_pin()): a new output with no
+    # init starts LOW; an existing output keeps its level.
     def _init_pin(self, gpio: str, pin_conf, default_new_output_to_zero: bool = False):
         for attempt in range(5):
             try:
@@ -744,10 +775,8 @@ class GPIOManager:
                 elif pin_type == "input" or (pin_type is None and init is not None):
                     self._setup_input(gpio, pin_conf.pullup)
                     if init is not None and pin_conf.watched:
-                        # Compare in the same space the API reports: get_pin_info applies
-                        # the pull-up normalisation and `reversed`, whereas the raw
-                        # gpiozero value used to do neither - so a reversed or pulled-up
-                        # input was tested against a number it never shows anywhere.
+                        # Compare against the value the API reports (pull-up and
+                        # `reversed` applied), not the raw gpiozero level.
                         ref = init if init != "last" else self.status.get(gpio)
                         if ref is not None and self.get_pin_info(gpio)["value"] != ref:
                             self._trigger_webhook(gpio)
@@ -758,11 +787,8 @@ class GPIOManager:
                     # this flag was set, so it couldn't have applied the watch itself.
                     self._apply_watch(gpio)
                 elif self.watches.pop(gpio, None):
-                    # Config says unwatched but a watch was live, so this call is turning it
-                    # off. (Reading the live watch rather than a stored watched:false is what
-                    # lets that flag never be persisted - see config_pin.) _setup_input above
-                    # re-attached the edge callbacks (self.watches was still set when it
-                    # ran), so detach them now or webhooks keep firing despite the unwatch.
+                    # Unwatching: _setup_input above re-attached the edge callbacks, so
+                    # detach them now or webhooks keep firing.
                     dev = self.devices.get(gpio)
                     if isinstance(dev, DigitalInputDevice):
                         dev.when_activated = dev.when_deactivated = None
@@ -800,20 +826,16 @@ class GPIOManager:
         gpio = str(gpio)
         if gpio in self.devices: self.devices[gpio].close()
         pull = False if pullup == "down" else (None if pullup == "none" else True)
-        # The hardware wins over the stored config: a "down"/"none" that predates the
-        # check in _require_valid_pullup would otherwise raise here on every read.
+        # The hardware wins over the stored config: GPIO 2/3 have a fixed pull-up and
+        # gpiozero rejects any other pull, so a stored "down"/"none" is ignored here.
         if gpio in _PI_FIXED_PULLUP_PINS: pull = True
         kwargs = {"active_state": True} if pull is None else {}
         self.devices[gpio] = DigitalInputDevice(int(gpio), pull_up=pull, bounce_time=0.05, **kwargs)
         if self.watches.get(gpio): self._apply_watch(gpio)
 
-    # gpiozero's lgpio backend keeps ONE edge registration for the whole chip, and closing
-    # an input device tears it down: every other watched input then stops firing while
-    # still reading correctly, so nothing looks wrong until an event never arrives.
-    # Recreating a device is the only thing that restores it - reassigning when_activated
-    # does not, because gpiozero only re-registers on a None -> handler transition.
-    # _setup_input recreates as it goes, so only the paths that close an input WITHOUT
-    # putting another in its place need this.
+    # Closing an input tears down lgpio's one shared edge registration, silencing every
+    # other watched input; recreating their devices restores it. Used where an input is
+    # closed without a replacement (_setup_input recreates on its own).
     def _rearm_watches(self, exclude: str):
         for gpio in list(self.watches):
             if gpio == exclude or not isinstance(self.devices.get(gpio), DigitalInputDevice):
@@ -916,8 +938,7 @@ class GPIOManager:
         self._revert_token[gpio] = token
 
         # "toggle" flips the current state; "on"/"off" are word spellings of 1/0. Any
-        # other string is rejected by WriteRequest before it ever reaches here (the old
-        # "flip" spelling included - it was renamed to "toggle", with no alias kept).
+        # other string is rejected by WriteRequest before it reaches here.
         sval = str(value).lower()
         if sval == "toggle":
             dev.toggle()
@@ -974,10 +995,9 @@ class GPIOManager:
         # type="remove" deletes the pin's config/device/watch entirely
         if update.get("type") == "remove":
             self.watches.pop(gpio, None)
-            # No need to switch a removed output to an undriven input first: close()
-            # already releases the pin, so it stops driving either way. Creating an input
-            # here and closing it again is what used to tear down gpiozero's shared lgpio
-            # edge registration, silently stopping every OTHER watched input from firing.
+            # close() releases the pin, so it stops driving. Don't create a temporary
+            # input here: closing an input breaks the shared edge registration (see
+            # _rearm_watches).
             self.config.gpios.pop(gpio, None)
             if gpio in self.devices:
                 self.devices[gpio].close()
@@ -1018,10 +1038,8 @@ class GPIOManager:
         # unwatch itself still happens - _init_pin below acts on the live watch.
         if current.watched is not True:
             current.watched = None
-        # A stale `init` from a previous type means something different for the new
-        # type (e.g. an output's startup value misread as an input's expected sensor
-        # reading) - drop it on an actual type change unless this same call supplies
-        # a fresh one.
+        # An init from the previous type means something else for the new one: drop it on
+        # a type change unless this call supplies a fresh one.
         if effective_type != original_type and "init" not in update:
             current.init = None
         self.config.gpios[gpio] = current
@@ -1070,16 +1088,13 @@ class GPIOManager:
             },
         }
 
+
+
     # Live, non-persisted facts about the machine this agent runs on. Returned under
     # `agent` by /config/read and /gpio/scan, and never stored in config.json - which
-    # is why _strip_readonly() drops it from anything posted back to /config/*.
+    # is why _normalize_config() drops it from anything posted back to /config/*.
     def _agent_info(self) -> dict:
-        try:
-            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-                s.connect(("8.8.8.8", 80))
-                local_ip = s.getsockname()[0]
-        except Exception:
-            local_ip = "127.0.0.1"
+        local_ip = _get_lan_ip()
         info = {
             "platform": _get_platform(),
             "os": _get_os(),
@@ -1097,7 +1112,7 @@ class GPIOManager:
         info["config_updated"] = _get_config_updated()
         return info
 
-    # NOTE: deliberately never includes api_key - this is the response for GET /config/read
+    # The GET /config/read response. Never includes api_key.
     @_locked
     def get_app_config(self) -> dict:
         return {
@@ -1125,9 +1140,7 @@ class GPIOManager:
         }
 
     # --- Sensors ---
-    # A sensor names a script in the agent's scripts/ folder to run; /sensor/read
-    # turns its output into JSON. Sensors are pure config + on-demand reads - no
-    # GPIO, no background threads, no persisted state beyond config.json.
+    # A sensor runs a script from scripts/; /sensor/read returns its output as JSON.
     SENSOR_TIMEOUT = 15.0  # seconds a sensor script may run before it's killed
 
     @_locked
@@ -1148,27 +1161,16 @@ class GPIOManager:
         log_to_file(f"[Sensor] {name} configured: {script}")
         return {"name": name, **self.config.sensors[name].model_dump(exclude_none=True)}
 
-    # Runs one sensor's script and shapes its stdout into JSON. The result is always
-    # nested under the sensor's name, so two sensors can never overwrite each other in
-    # /sensor/read: a JSON object with several fields nests whole ({name: {...}}), a
-    # JSON object with a single field contributes just that field's value
-    # ({name: value}, the field's own key is dropped), and anything else (a bare
-    # number, string, list, or non-JSON text) is wrapped the same way. Missing scripts and
-    # failed/empty scripts return a clear {name: "<reason>"} message. The script
-    # name always resolves inside scripts/ next to main.py. Scripts are re-validated
-    # here on every read (not just at config time) because /config/load and a
-    # hand-edited config.json can install sensors without passing through
-    # config_sensor; one that fails validation reads as {name: "blocked: <reason>"}.
+    # Runs one sensor's script; output is nested under the sensor's name (shapes in the
+    # README). Re-validated every read: {name: "blocked: <reason>"} or {name: "<reason>"}.
     SENSOR_OUTPUT_CAP = 2048   # max chars read from a script's stdout
 
     def _read_sensor_value(self, name: str, conf: SensorConfig) -> dict:
         err = _validate_sensor_script(conf.script)
         if err:
             return {name: f"blocked: {err}"}
-        # '<script-file> [args...]' - always run as `sh scripts/<file> <args>`, so it
-        # works without a ./ prefix, a +x bit, or the directory being on PATH, and no
-        # shell ever parses the configured string. start_new_session puts the script in
-        # its own process group so a timeout can kill it together with any children.
+        # Run as `sh scripts/<file> <args>` (no shell parses the string), in its own process
+        # group so a timeout kills it with any children.
         script, *args = shlex.split(conf.script)
         path = os.path.join(SENSOR_SCRIPTS_DIR, script)
         if not os.path.isfile(path):
@@ -1212,12 +1214,9 @@ class GPIOManager:
                 result[name] = f"error: {e}"
         return result
 
-    # Applies a partial config update (POST /config/update). The body may spell each
-    # grouped field either inside its group or at the root (_normalize_config folds the
-    # root form in). Every group merges key by key rather than replacing, so a bridge
-    # pushing its own URL never clears the other bridge's, and setting log_days never
-    # resets logs_enabled. api_key only changes on a real value; log_days is clamped to
-    # 0-30 and 0 wipes the log immediately; an empty string clears a URL/key field.
+    # POST /config/update: grouped fields may also be sent at the root. Groups merge key by
+    # key, api_key changes only on a real value, log_days is clamped to 0-30 (0 wipes the
+    # log), and an empty string clears a URL/key field.
     @_locked
     def set_app_config(self, update: dict) -> dict:
         self._backup_config()
@@ -1251,10 +1250,8 @@ class GPIOManager:
     @_locked
     def load_config(self, data: dict) -> None:
         self._backup_config()
-        # Preserve the current API key when the loaded config doesn't supply one
-        # (matching pico-gpio-api) - /config/read never exposes api_key, so a
-        # read-modify-load round trip would otherwise silently reset the key to
-        # the well-known default.
+        # Keep the current API key when the loaded config has none: /config/read never
+        # exposes it, so a read-modify-load round trip would reset it to the default.
         data = _normalize_config(data)
         data.setdefault("api_key", self.config.api_key)
         _atomic_write_json(CONFIG_FILE, data)
@@ -1280,8 +1277,7 @@ class GPIOManager:
 
     # Every place a watched event should be delivered, as (url, headers) pairs:
     # the general-purpose webhook_url plus each smart-home bridge's own callback
-    # field. A bridge sets only its own field, so no bridge can overwrite another's
-    # the way sharing webhook_url forced them to.
+    # field. A bridge sets only its own field, so bridges never overwrite each other.
     def _notify_targets(self) -> list:
         targets = []
         if self.config.notifications.webhook:
@@ -1289,10 +1285,8 @@ class GPIOManager:
             # configured - the agent's own api_key must never leak to the target.
             key = self.config.notifications.webhook_key
             targets.append((self.config.notifications.webhook, {"Api-Key": key} if key else {}))
-        # Each bridge callback carries the key that bridge generated and pushed into
-        # its own bridges.<name>_key field - never the agent's own api_key, same rule
-        # as webhook_url. A bridge with no key set yet gets the POST unauthenticated
-        # (and will reject it, which is the point).
+        # Each bridge gets its own bridges.<name>_key, never the agent's api_key; with no
+        # key set yet the POST goes unauthenticated and the bridge rejects it.
         for url, key in ((self.config.bridges.matter, self.config.bridges.matter_key),
                          (self.config.bridges.homekit, self.config.bridges.homekit_key),
                          (self.config.bridges.homebridge, self.config.bridges.homebridge_key)):
@@ -1322,12 +1316,9 @@ class GPIOManager:
 
     @staticmethod
     def _post_webhook(url: str, payload: dict, headers: dict, timeout: float = 8.0):
-        """One delivery attempt, then up to WEBHOOK_RETRIES more WEBHOOK_RETRY_DELAY apart.
-        A non-2xx answer counts as a failure too, not just a connection error: a bridge
-        that restarted answers 401 until it has re-pushed its key onto this agent, and the
-        retry is what gets that event through once it has. Runs on the caller's daemon
-        thread, so a failing target keeps one sleeping thread alive per event for about a
-        minute - bounded by the per-pin WEBHOOK_MIN_INTERVAL debounce."""
+        """One delivery plus up to WEBHOOK_RETRIES retries, WEBHOOK_RETRY_DELAY apart. A
+        non-2xx answer is a failure too: a restarted bridge answers 401 until it has
+        re-pushed its key. Runs on the caller's daemon thread."""
         for attempt in range(GPIOManager.WEBHOOK_RETRIES + 1):
             if attempt:
                 time.sleep(GPIOManager.WEBHOOK_RETRY_DELAY)
@@ -1363,8 +1354,6 @@ class GPIOManager:
             dev.when_activated = dev.when_deactivated = lambda: self._on_edge(gpio)
 
 
-# Direct JSON patch to config.json - used by CLI flags (--api-key with --save)
-# to persist settings before `manager` exists yet
 def update_config_file(updates: dict):
     """Direct JSON patch to config.json (the CLI --save path). Accepts root aliases like
     the REST endpoints do, and merges a group one level deep so patching one field of
@@ -1383,11 +1372,8 @@ def update_config_file(updates: dict):
     _atomic_write_json(CONFIG_FILE, data)
 
 
-# Runs once when config.json doesn't exist yet. GPIOManager() has already saved
-# a config.json with the default API key ("your-secret-key") by the time this
-# runs - this just fills in the hostname as the agent name. No prompt: main.py
-# starts unattended either way. Interactive/-y setup happens in install.sh,
-# before main.py is ever invoked.
+# Runs once when config.json doesn't exist yet: names the agent after the hostname.
+# No prompt; interactive setup happens in install.sh.
 def _first_time_setup():
     manager.config.name = _default_name()
     manager._save_config()
@@ -1405,12 +1391,8 @@ threading.Thread(target=_log_cleanup_loop, daemon=True).start()
 # Resolves the LAN-facing private IP (via a UDP "connect" - no packets actually sent)
 # and the internet-facing public IP, for the startup banner
 def _get_ips():
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(("8.8.8.8", 80))
-        private = s.getsockname()[0]
-        s.close()
-    except Exception:
+    private = _get_lan_ip()
+    if private == "127.0.0.1":
         private = "unavailable"
     try:
         public = requests.get("https://api.ipify.org", timeout=5).text.strip()
@@ -1451,14 +1433,9 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
 
 
 async def _buffer_body(receive, limit: int):
-    """Drain a request body that carries no Content-Length (a chunked upload) up to `limit`,
-    so the header check isn't the only thing standing between us and an unbounded read.
-
-    Returns `(messages, oversized)`: the ASGI messages consumed, to be replayed to the app,
-    and whether the cap was passed. Deliberately buffer-and-replay rather than truncating
-    the stream: a truncated body reaches the app as *no* body, and `/config/load` treats an
-    unparseable body as `{}`, which resets the whole config. Answering 413 and never calling
-    the app is the only safe way to refuse it."""
+    """Buffer a chunked request body (no Content-Length) up to `limit`. Returns
+    `(messages, oversized)`. An oversized body is answered 413 and never reaches the app,
+    since a cut-off body would parse as `{}` and reset the config via /config/load."""
     messages = []
     total = 0
     while True:
@@ -1567,10 +1544,8 @@ async def verify_api_key(request: Request):
     return api_key
 
 # --- REST Routes ---
-# Handlers are plain `def` on purpose: FastAPI runs sync handlers in its threadpool, so
-# blocking work (gpiozero claims with retry sleeps, SD-card file writes) can't stall the
-# event loop - /hello and other requests keep responding while one request is slow.
-# GPIOManager's RLock serializes the actual state mutation across those threads.
+# Handlers are plain `def`, so FastAPI runs them in its threadpool and slow GPIO or file
+# work never stalls the event loop; GPIOManager's RLock serializes the state changes.
 
 @app.get("/gpio/read", dependencies=[Depends(verify_api_key)])
 def read_gpio_all():
@@ -1665,11 +1640,9 @@ async def config_load(request: Request):
 
 @app.post("/restart", dependencies=[Depends(verify_api_key)])
 async def restart_server(request: Request):
-    """Restarts the server process. Pass {"reboot": true} to reboot the physical
-    device instead - only honored on a real Raspberry Pi (IS_PI); on Mac/dev
-    machines reboot is ignored and the process is restarted as usual. The actual
-    action runs on a short delay in a daemon thread so this response can flush
-    to the client first."""
+    """Restarts the server process. {"reboot": true} reboots the device instead (real Pi
+    only; elsewhere it restarts the process), falling back to a restart if the reboot fails.
+    Runs after a short delay so this response is sent first."""
     try:
         body = await request.json()
     except Exception:
@@ -1696,11 +1669,9 @@ async def restart_server(request: Request):
 
 @app.post("/upgrade", dependencies=[Depends(verify_api_key)])
 async def upgrade_server():
-    """Upgrade the agent in place: runs `install.sh --upgrade` (re-downloads the
-    latest release files and reinstalls dependencies), then restarts the process so
-    the new code takes effect. Takes no parameters. The download + restart run on a
-    short delay in a daemon thread so this response can flush to the client first;
-    if the install fails, the current code keeps running (see the log)."""
+    """Upgrades in place: runs `install.sh --upgrade`, then restarts so the new code takes
+    effect. Runs after a short delay so this response is sent first; if the install fails,
+    the current code keeps running (see the log)."""
     if os.environ.get("CTRLPI_RELOAD") == "1":
         raise HTTPException(
             status_code=409,

@@ -1,28 +1,17 @@
-# Python and virtual environments / Byte-compiled files
+# Python and virtual environments
 *.py[cod]
 *$py.class
-*.mpy
 __pycache__/
 venv/
 .venv/
 .env
-.env.local
 
-# OS generated files
+# OS-specific files
 .DS_Store
-.DS_Store?
-._*
-.Spotlight-V100
-.Trashes
-ehthumbs.db
-Thumbs.db
 
-# IDE settings / Editors
+# IDE settings
 .vscode/
 .idea/
-*.swp
-*.swo
-*~
 
 # Project-specific state & configuration
 config.json
@@ -30,5 +19,4 @@ config-*.json
 status.json
 *.log
 scripts/
-wifi.txt
-min/
+

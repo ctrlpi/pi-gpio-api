@@ -6,6 +6,17 @@ cd "$(dirname "$0")"
 
 VENV_DIR="venv"
 
+# Parse arguments to check for --lite flag.
+RUN_LITE=false
+ARGS=()
+for arg in "$@"; do
+  if [ "$arg" = "--lite" ]; then
+    RUN_LITE=true
+  else
+    ARGS+=("$arg")
+  fi
+done
+
 # Recreate the venv if missing or broken.
 if [ ! -x "$VENV_DIR/bin/python" ] || ! "$VENV_DIR/bin/python" -c '' 2>/dev/null; then
   [ -d "$VENV_DIR" ] && echo "Rebuilding virtual environment..." || echo "Creating virtual environment..."
@@ -18,6 +29,10 @@ if [ ! -x "$VENV_DIR/bin/python" ] || ! "$VENV_DIR/bin/python" -c '' 2>/dev/null
   fi
   echo "Installing dependencies..."
   # Skip gpiozero installation on non-Pi machines.
+  FILTER_EXPR='^$'
+  if [ "$RUN_LITE" = true ]; then
+    FILTER_EXPR='^(fastapi|pydantic|uvicorn)$'
+  fi
   if grep -qi raspberry /proc/device-tree/model 2>/dev/null; then
     # Check for required GPIO backend.
     if ! python3 -c "import lgpio" 2>/dev/null && ! python3 -c "import RPi.GPIO" 2>/dev/null; then
@@ -27,11 +42,24 @@ if [ ! -x "$VENV_DIR/bin/python" ] || ! "$VENV_DIR/bin/python" -c '' 2>/dev/null
       echo "  ./run.sh" >&2
       exit 1
     fi
-    "$VENV_DIR/bin/python" -m pip install --quiet -r requirements.txt
+    if [ "$RUN_LITE" = true ]; then
+      grep -viE "$FILTER_EXPR" requirements.txt | "$VENV_DIR/bin/python" -m pip install --quiet -r /dev/stdin
+    else
+      "$VENV_DIR/bin/python" -m pip install --quiet -r requirements.txt
+    fi
   else
     echo "Not a Raspberry Pi - skipping gpiozero."
-    grep -viE '^gpiozero$' requirements.txt | "$VENV_DIR/bin/python" -m pip install --quiet -r /dev/stdin
+    FILTER_EXPR='^gpiozero$'
+    if [ "$RUN_LITE" = true ]; then
+      FILTER_EXPR='^(gpiozero|fastapi|pydantic|uvicorn)$'
+    fi
+    grep -viE "$FILTER_EXPR" requirements.txt | "$VENV_DIR/bin/python" -m pip install --quiet -r /dev/stdin
   fi
+fi
+
+# Auto-detect if fastapi and pydantic are installed; if not, automatically run lite.py regardless of --lite flag.
+if ! "$VENV_DIR/bin/python" -c "import fastapi, pydantic" 2>/dev/null; then
+  RUN_LITE=true
 fi
 
 IP=$(hostname -I 2>/dev/null | awk '{print $1}' || ipconfig getifaddr en0 2>/dev/null || echo "localhost")
@@ -40,4 +68,8 @@ echo ""
 echo "Starting server at http://$IP:8314"
 echo ""
 
-"$VENV_DIR/bin/python" main.py "$@"
+if [ "$RUN_LITE" = true ]; then
+  "$VENV_DIR/bin/python" lite.py "${ARGS[@]}"
+else
+  "$VENV_DIR/bin/python" main.py "${ARGS[@]}"
+fi

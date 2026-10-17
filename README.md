@@ -1,17 +1,17 @@
 # Raspberry Pi GPIO API
 
 [![Platform: Raspberry Pi](https://img.shields.io/badge/platform-Raspberry%20Pi-006400.svg)](#install-on-your-pi)
-[![Version 0.9.23](https://img.shields.io/badge/version-0.9.23-blue.svg)](https://github.com/ctrlpi/pi-gpio-api/tags)
+[![Version 0.9.26](https://img.shields.io/badge/version-0.9.26-blue.svg)](https://github.com/ctrlpi/pi-gpio-api/tags)
 [![Python 3.9+](https://img.shields.io/badge/python-3.9%2B-blue.svg)](https://www.python.org/)
 [![Auth: Api-Key](https://img.shields.io/badge/auth-Api--Key-orange.svg)](#authentication)
-[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+[![License: MIT](https://img.shields.io/badge/license-MIT-188038.svg)](LICENSE)
 ![Status: Beta](https://img.shields.io/badge/status-Beta-red.svg)
 
 A Python server that exposes Raspberry Pi GPIO control through an OpenAPI REST API, allowing HTTP clients to trigger outputs and read inputs remotely.
 
 Runs on a Raspberry Pi, secured with API key authentication, GPIO via `gpiozero`.
 
-> Looking for AI-agent / MCP control, Apple HomeKit or Google Home? See the [Related projects](#related-projects) below that drive one or more of these API servers (Pi or Pico) over their REST endpoints.
+> Looking for AI-agent / MCP control, Apple HomeKit or Google Home? See the [Related projects](#related-projects) below that drive one or more of these API servers (Pi, Pico, or ESP32) over their REST endpoints.
 
 ## Install on your Pi
 
@@ -26,6 +26,8 @@ curl -fsSL https://raw.githubusercontent.com/ctrlpi/pi-gpio-api/main/install.sh 
 ```
 
 If `config.json` doesn't exist yet, you'll be asked for an agent name and API key (hostname suggested as the default name, `your-secret-key` as the key). Pass `-y` to skip the prompt and take both defaults.
+
+The installer prompts whether to install the recommended **Lite** version or the **Full** version (pass `--lite` or `--full` to select directly; see [Lite or Full version](#lite-or-full-version)).
 
 Re-running the downloaded copy directly (`./install.sh`) only reinstalls dependencies
 into the existing venv (creating one first if missing) - it won't re-download the files
@@ -63,6 +65,9 @@ Or use **cron** (one-liner adding to crontab, run from inside the project direct
 ```bash
 # Recommended: starts server, build/fix venv if needed
 ./run.sh
+
+# Run the Lite version explicitly
+./run.sh --lite
 
 # Set and persist API key (drop --save to apply to this run only)
 ./run.sh --api-key your-secret-key --save
@@ -168,7 +173,7 @@ Api-Key: your-secret-key
 
 ## REST API
 
-Interactive OpenAPI docs are served at `/docs` (Swagger UI) and `/redoc` when the `docs_enabled` config field is on (default: off). Enable it at startup with `--fastapi-docs-enabled` (add `--save` to persist), or toggle it at runtime via `POST /config/update` (no restart needed).
+Interactive OpenAPI docs are served at `/docs` (Swagger UI) and `/redoc` in the **Full version only** when the `docs_enabled` config field is on (default: off; ignored in the Lite version). Enable it at startup with `--fastapi-docs-enabled` (add `--save` to persist), or toggle it at runtime via `POST /config/update` (no restart needed).
 
 ## Health
 
@@ -189,7 +194,7 @@ The core of the API: read, write, configure, and watch GPIO pins. Every pin is a
 | `POST` | `/gpio/write/{name_or_gpio}` | Write a value to a pin |
 | `POST` | `/gpio/config/{name_or_gpio}` | Configure a pin (name, type, init, pullup, max, reversed, watched) |
 | `GET` | `/gpio/watched` | List all currently watched pins, the active webhook URL, and the `bridges` callback URLs (URLs only, never the keys) |
-| `GET` | `/gpio/scan` | Scan all BCM GPIO pins (Pi hardware only). Returns `level` (the physical state) and `value` (logical). Also returns: `platform`, `os`, `version`, `ip` and `cpu_temperature`. |
+| `GET` | `/gpio/scan` | Scan all BCM GPIO pins (Pi hardware only). Returns `level` (the physical state) and `value` (logical). Also returns the live `agent` block; the pin list is keyed `gpios`. |
 
 ### Request Bodies
 
@@ -308,10 +313,10 @@ Returns the agent's identity plus its full config:
 | Field | Description |
 |-------|-------------|
 | `name` | Agent name: configured name, else the hostname, or `pi-<model>-<serial4>` when the hostname is the stock `raspberrypi`. |
-| `agent` | Live machine facts, computed on every read and **never stored**, in this order:<br>`platform`: the board model with the marketing words dropped (`Raspberry Pi 5 Model B Rev 1.1` is reported as `Pi 5 B Rev 1.1`)<br>`os`: on a Pi the distro codename and word size, e.g. `Bookworm 64-bit` or `Trixie 32-bit`; the bare system/release pair elsewhere<br>`host`: this machine's hostname<br>`serial`: the board serial from `/proc/cpuinfo`, `""` off-Pi<br>`ip`: this machine's local network address<br>`mac`: the address of the interface carrying that `ip`, wireless or wired, whichever holds the default route; `""` if it can't be determined<br>`wifi`: SSID, `""` when wired or unavailable<br>`signal`: dBm, `null` with no wireless link<br>`cpu_temperature`: Pi only, absent off-Pi<br>`uptime`: a short human string of at most two units, largest first (`"3d 4h"`, `"4h 12m"`, `"12m"`, `"38s"`)<br>`version`: the agent's software version<br>`config_updated`: when `config.json` itself was last written, as UTC `"YYYY-MM-DD HH:MM:SS"` (the file's own mtime, so it answers "when did this agent last change"); `""` if it has never been written<br><br>Sending it back on `/config/update` or `/config/load` is ignored. `version` is kept in lockstep with `pico-gpio-api`, so a matching `version` means matching API behavior. |
+| `agent` | Live machine facts, computed on every read and **never stored**, in this order:<br>`platform`: the board model with the marketing words dropped (`Raspberry Pi 5 Model B Rev 1.1` is reported as `Pi 5 B Rev 1.1`)<br>`os`: on a Pi the distro codename and word size, e.g. `Bookworm 64-bit` or `Trixie 32-bit`; the bare system/release pair elsewhere<br>`host`: this machine's hostname<br>`serial`: the board serial from `/proc/cpuinfo`, `""` off-Pi<br>`ip`: this machine's local network address<br>`mac`: the address of the interface carrying that `ip`, wireless or wired, whichever holds the default route; `""` if it can't be determined<br>`wifi`: SSID, `""` when wired or unavailable<br>`signal`: dBm, `null` with no wireless link<br>`cpu_temperature`: Pi only, absent off-Pi<br>`uptime`: a short human string of at most two units, largest first (`"3d 4h"`, `"4h 12m"`, `"12m"`, `"38s"`)<br>`version`: the agent's software version<br>`config_updated`: when `config.json` itself was last written, as UTC `"YYYY-MM-DD HH:MM:SS"` (the file's own mtime, so it answers "when did this agent last change"); `""` if it has never been written<br><br>Sending it back on `/config/update` or `/config/load` is ignored. `version` is kept in lockstep with `pico-gpio-api` and `esp32-gpio-api`, so a matching `version` means matching API behavior. |
 | `notifications` | The general-purpose webhook target: `webhook` and `webhook_key`. |
 | `bridges` | The three bridge callbacks: `homekit`, `homekit_key`, `matter`, `matter_key`, `homebridge`, `homebridge_key` (see [Bridge callbacks](#bridge-callbacks-bridgeshomekit--bridgesmatter--bridgeshomebridge)). |
-| `settings` | Operational toggles: `docs_enabled`, `logs_enabled`, `log_days`. |
+| `settings` | Operational toggles: `docs_enabled` (Full version only; ignored in Lite), `logs_enabled`, `log_days`. |
 | `sensors` | Named-sensor configuration map (see [Sensors](#sensors)). |
 | `gpios` | Per-pin configuration map (see [GPIO](#gpio); always the last field). |
 
@@ -341,13 +346,16 @@ so a later `/config/read` shows them nested:
 |---|---|
 | `webhook_url`, `webhook_key` | `notifications.webhook`, `notifications.webhook_key` |
 | `matter`, `matter_key`, `homekit`, `homekit_key`, `homebridge`, `homebridge_key` | `bridges.*` |
-| `docs_enabled`, `logs_enabled`, `log_days` | `settings.*` |
+| `docs_enabled`, `logs_enabled`, `log_days` | `settings.*` (`docs_enabled` applies to Full version only) |
 | `name`, `api_key` | top level, ungrouped |
 
 The grouped spelling works too (`{"settings": {"log_days": 5}}`), and either way each group
 **merges key by key** - setting `log_days` never resets `logs_enabled`, and a bridge pushing
 its own URL never clears the other bridge's. `/config/load` accepts both forms as well, and
 always writes `config.json` in the grouped shape.
+
+Keys, names, URLs and scripts are always text: a number sent for one is stored as text
+(`4242` becomes `"4242"`), on `/config/update`, `/config/load`, `/gpio/config` and `/sensor/config`.
 
 `webhook_key` is a dedicated key for the webhook *target* (see Webhooks below); it is not the agent's own `api_key`. An empty string clears it, same as `webhook_url`.
 
@@ -394,11 +402,10 @@ attempt is logged, with the reason and whether another is coming.
 Three extra callback URLs, one owned by each smart-home bridge, sit alongside `webhook_url`:
 `homekit` for the standalone `homekit-bridge`, `matter` for `matter-bridge`, and `homebridge`
 for the `homebridge-ctrlpi` plugin. They are **additive**: a watched event is POSTed to every
-configured target, with the same payload, so a bridge no longer has to take over `webhook_url`.
+configured target, with the same payload, so the bridges and `webhook_url` never compete.
 
-`homebridge` exists so the Homebridge plugin and the standalone `homekit-bridge` can drive the
-same agent at once. Both put pins in the Home app, and while they shared the `homekit` slot,
-whichever configured itself last silently stopped the other receiving events.
+`homebridge` has its own slot, so the Homebridge plugin and the standalone `homekit-bridge`
+can drive the same agent at once.
 
 ```bash
 curl -X POST http://<pi-host-addr>:8314/config/update \
@@ -466,14 +473,37 @@ The state the agent persists to disk, all in the project directory alongside `ma
 | `status.json` | Last known pin values, restored on reboot when `init: "last"`. Inputs are recorded too, so a watched input's `init: "last"` reference has a previous reading to compare against |
 | `agent.log` | Server log, persists across restarts; trimmed to `log_days` by an hourly pass |
 
+## Lite or Full version
+
+`pi-gpio-api` offers two installation and runtime packages:
+
+- **Lite (recommended)**: runs via `lite.py`. Lightweight socket server, fast startup, zero dependencies on FastAPI or Pydantic. Strongly recommended for all standard setups and for the smaller boards (Zero W, Zero 2 W), which struggle with heavy dependencies.
+- **Full**: runs via `main.py`. Includes FastAPI, Pydantic, and Uvicorn for interactive `/docs` (Swagger UI) and `/redoc` pages.
+
+Install with `./install.sh --lite` or `./install.sh --full` (default is Lite). To run Lite explicitly, pass `--lite` to `run.sh` (`./run.sh --lite`). If FastAPI and Pydantic are not installed, `run.sh` automatically runs `lite.py`.
+
+## Tests
+
+Run the test suite with:
+
+```bash
+python test.py
+```
+
+The test suite runs the server locally and tests against its REST API: authentication, configuration read/update/load, GPIO output configuration, reading/writing/toggling pin values, duration pulses, watched pins, off-Pi scan fallback, sensor script execution and security validation (path traversal and argument injection blocking), log retrieval, and request body size limits.
+
 ## Related projects
 
 - **[`pico-gpio-api`](https://github.com/ctrlpi/pico-gpio-api)**: Raspberry Pi Pico W port of the GPIO REST server, with the same endpoints, wire format, and auth.
+- **[`esp32-gpio-api`](https://github.com/ctrlpi/esp32-gpio-api)**: ESP32 port of the GPIO REST server for MicroPython, with the same endpoints, wire format, and auth.
 - **[`mcp-bridge`](https://github.com/ctrlpi/mcp-bridge)**: MCP server that exposes GPIO control as tools for AI agents (e.g. Claude), executing them over the agents' REST API.
-- **`homekit-bridge`** *(coming soon)*: native Apple HomeKit bridge that exposes GPIO pins and sensors as HomeKit accessories, driven over the agents' REST API.
+- **[`homebridge-ctrlpi`](https://github.com/ctrlpi/homebridge-ctrlpi)**: A Homebridge plugin that brings Raspberry Pi, Pico W, and ESP32 GPIO into Apple Home, by driving one or more GPIO agents over their REST API.
+- **`homekit-bridge`** *(coming soon)*: Native Apple HomeKit bridge that exposes GPIO pins and sensors as HomeKit accessories, driven over the agents' REST API.
 - **`matter-bridge`** *(coming soon)*: Matter bridge that exposes GPIO pins and sensors to any Matter platform (Apple Home, Google Home, Alexa, Home Assistant), driven over the agents' REST API.
-- **`gpio-lab`** *(coming soon)*: Web dashboard for monitoring and controlling agents over REST API and MCP.
-- **[`pico-bay`](https://github.com/ctrlpi/pico-bay)**: An App and MCP Server for managing Raspberry Pi Pico and ESP32 boards with MicroPython and CircuitPython over USB.
+- **[`ctrlpi-cli`](https://github.com/ctrlpi/ctrlpi-cli)**: Command-line interface for interacting with ctrlPi agents, with shared agent configuration.
+- **[`ctrlpi-lab`](https://github.com/ctrlpi/ctrlpi-lab)**: A local browser dashboard for your ctrlPi setup. Test GPIO and sensor endpoints, watch webhook events, and tail agent logs.
+- **[`pico-bay`](https://github.com/ctrlpi/pico-bay)**: Web app and MCP server for managing MicroPython and CircuitPython boards, such as the Raspberry Pi Pico and ESP32, over USB.
+- **`pi-bay`** *(coming soon)*: A local web app and MCP server for Raspberry Pi boards over the network. Edit files, open a remote terminal, and manage your Pi remotely.
 
 ## License
 

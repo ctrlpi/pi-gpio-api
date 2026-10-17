@@ -1,4 +1,4 @@
-# CLAUDE.md
+# CLAUDE.md - pi-gpio-api
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
@@ -11,7 +11,7 @@ A Python server for Raspberry Pi that exposes GPIO pin control over a FastAPI RE
 ## Setup & Running
 
 ```bash
-# Recommended — handles venv, installs deps, starts server (pass --reload for auto-reload)
+# Recommended: handles venv, installs deps, starts server (pass --reload for auto-reload)
 ./run.sh [--reload]
 
 # Manual
@@ -39,8 +39,15 @@ Everything lives in **`main.py`**.
 
 Sensor scripts live in **`scripts/`**. The API executes them directly.
 
+### `lite.py` (the Lite version)
+
+A second, self-contained server with the same REST API and no FastAPI/Pydantic/uvicorn: a plain socket accept loop, one thread per connection, hand-written request parsing (`_recv_request`, `_parse_request`) and routing in `handle_request`. `./run.sh --lite` starts it, and `run.sh` falls back to it automatically whenever `fastapi`/`pydantic` don't import; `install.sh` asks Lite or Full (`--lite`/`--full`). It must keep **the same wire behaviour as `main.py`** (routes, status codes, JSON shapes), so the same `api-tester` suite runs against both: a change to one almost always needs the same change in the other.
+
+**Request bodies** follow `main.py`'s `CheckApiMiddleware`: a `Content-Length` over `MAX_REQUEST_BYTES` (16 KB) is answered `413`, and a chunked body (no `Content-Length`) is decoded by `_recv_chunked` up to the same cap, `413` past it. A partial or unreadable body must never reach a route as an empty one, since `/config/load` applies an empty body as `{}`, a full config reset.
+
 ## Key Design Logic
 
+- **Text fields stay text**: a number sent for a key, name, URL or script (`api_key`, `name`, `notifications.*`, `bridges.*`, a pin's `name`, a sensor's `script`) is stored as text, so `4242` becomes `"4242"` and a key typed as digits never locks the agent out. `_as_text()` / `_text_fields()` run in `_normalize_config()` (every `/config/update` and `/config/load`) and in `config_pin()` / `config_sensor()`. In `main.py` the request models also take numbers as text (`coerce_numbers_to_str`), since pydantic would otherwise refuse them with 422. `test_numbers_stored_as_text` covers it.
 - **Duration clamping**: If `max` is set on a pin and no duration is given, `max` becomes the effective duration. Handled via a daemon thread.
 - **Write auto-configure**: `write_pin()` configures a pin as `output` only if it is unconfigured. Writing to an `input` pin raises a 400 error to prevent accidental sensor overrides.
 - **Output config defaults**: Explicitly configuring a new `output` pin starts it at LOW (`0`) unless an `init` value is provided. 
@@ -50,7 +57,7 @@ Sensor scripts live in **`scripts/`**. The API executes them directly.
 - **Sensors**: Scripts run via `["sh", scripts/<file>, *args]` with a 15-second timeout. Filenames must match `_SCRIPT_NAME_RE` and stay confined to the `scripts/` directory for security.
 - **`/hello` endpoint**: Bypasses auth and logging entirely to serve as a fast, quiet polling endpoint.
 - **Log retention**: Controlled by `config.log_days`. Setting to `0` clears the log immediately.
-- **Restart/reboot (`/restart`)**: Process restarts use `os.execv` to preserve PID and bind port 8314 instantly (since Python 3.4+ sockets are non-inheritable). A full device reboot via `{"reboot": true}` is supported on Pi devices with passwordless sudo.
+- **Restart/reboot (`/restart`)**: Process restarts use `os.execv` to preserve PID and bind port 8314 instantly (since Python 3.4+ sockets are non-inheritable). A full device reboot via `{"reboot": true}` is supported on Pi devices with passwordless sudo; if device reboot fails, it falls back to an in-process restart.
 
 ## Authentication
 
