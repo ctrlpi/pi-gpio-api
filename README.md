@@ -1,13 +1,13 @@
 # Raspberry Pi GPIO API
 
 [![Platform: Raspberry Pi](https://img.shields.io/badge/platform-Raspberry%20Pi-006400.svg)](#install-on-your-pi)
-[![Version 0.9.26](https://img.shields.io/badge/version-0.9.26-blue.svg)](https://github.com/ctrlpi/pi-gpio-api/tags)
+[![Version 0.9.27](https://img.shields.io/badge/version-0.9.27-blue.svg)](https://github.com/ctrlpi/pi-gpio-api/tags)
 [![Python 3.9+](https://img.shields.io/badge/python-3.9%2B-blue.svg)](https://www.python.org/)
 [![Auth: Api-Key](https://img.shields.io/badge/auth-Api--Key-orange.svg)](#authentication)
 [![License: MIT](https://img.shields.io/badge/license-MIT-188038.svg)](LICENSE)
 ![Status: Beta](https://img.shields.io/badge/status-Beta-red.svg)
 
-A Python server that exposes Raspberry Pi GPIO control through an OpenAPI REST API, allowing HTTP clients to trigger outputs and read inputs remotely.
+A Python server that exposes Raspberry Pi GPIO control through a REST API, allowing HTTP clients to trigger outputs and read inputs remotely.
 
 Runs on a Raspberry Pi, secured with API key authentication, GPIO via `gpiozero`.
 
@@ -15,7 +15,7 @@ Runs on a Raspberry Pi, secured with API key authentication, GPIO via `gpiozero`
 
 ## Install on your Pi
 
-**Requirements:** Python 3.9+ (any recent Raspberry Pi OS ships one; Bullseye has 3.9, Bookworm 3.11) on any of the following models: **Raspberry Pi 2 / 3 / 4 / 5 / Zero W / Zero 2 W**.
+**Requirements:** Python 3.9+ (any recent Raspberry Pi OS ships one; Bullseye has 3.9, Bookworm 3.11) on any of the following models: **Raspberry Pi A+ / B+ / 2 / 3 / 4 / 5 / Zero W / Zero 2 W**.
 
 ### Option 1: curl (recommended)
 
@@ -447,11 +447,11 @@ It carries no pin fields; consumers of the webhook feed should treat entries wit
 
 ### Authentication
 
-If a dedicated `webhook_key` is configured, it is sent as the `Api-Key` header on every webhook POST; if not, no `Api-Key` header is sent at all. The agent's own `api_key` is never sent to the webhook target. The public `https://ctrlpi.com/webhook/test` test endpoint requires no key, it will display whatever key was sent for debugging.
+If a dedicated `webhook_key` is configured, it is sent as the `Api-Key` header on every webhook POST; if not, no `Api-Key` header is sent at all. The agent's own `api_key` is never sent to the webhook target. The public `https://hooks.ctrlpi.com/webhook/test` test endpoint requires no key, it will display whatever key was sent for debugging.
 
 ### Testing webhooks
 
-For development and testing, ctrlPi provides a public test endpoint: point `webhook_url` at `https://ctrlpi.com/webhook/test` and monitor the incoming events live at [https://ctrlpi.com/webhook/watch](https://ctrlpi.com/webhook/watch). The feed is public and events are retained only briefly, so use it for verification during setup, not as a production target.
+For development and testing, ctrlPi provides a public test endpoint: point `webhook_url` at `https://hooks.ctrlpi.com/webhook/test` and monitor the incoming events live at [https://ctrlpi.com/webhook/watch](https://ctrlpi.com/webhook/watch). The feed is public and events are retained only briefly, so use it for verification during setup, not as a production target.
 
 ### Changing the URL
 

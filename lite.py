@@ -25,7 +25,7 @@ except ModuleNotFoundError as e:
     print("  or use: run.sh to create/enable a virtual environment (venv) and start")
     raise SystemExit(1)
 
-VERSION = "0.9.26"  # agent software version (kept in lockstep with pico-gpio-api); surfaced in /config/read
+VERSION = "0.9.27"  # agent software version (kept in lockstep with pico-gpio-api); surfaced in /config/read
 IS_PI = os.path.exists("/proc/device-tree/model")  # only real Pi hardware exposes this
 _PI_GPIO_PINS = [str(p) for p in range(2, 28)]  # usable BCM range (2-27)
 # GPIO 2 and 3 have fixed hardware pull-ups on all Pi boards.
@@ -517,9 +517,118 @@ def _get_lan_ip() -> str:
     return "127.0.0.1"
 
 
+# Webhook delivery: one worker thread and one kept-alive requests.Session per target URL.
+# A fresh HTTPS connection costs a slow board seconds (a Pi 1 A+ measured ~3 s for one and
+# ~9 s each for three at once, past the ~10 s the hooks server allows for a handshake); a
+# reused one costs ~0.2 s. Per target, so a dead bridge never holds up another target's
+# events, and one worker per target keeps its events in order. Headers go on each request,
+# never on the session, so a target's Api-Key cannot reach another target.
+class _WebhookTarget:
+    def __init__(self, sender, url):
+        self.sender, self.url = sender, url
+        self.items = []                    # [due, attempt, payload, headers], oldest first
+        self.cond = threading.Condition()
+        self.session = None
+        self.reused = False                # the session has delivered before: its socket may be stale
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def put(self, payload, headers):
+        with self.cond:
+            if len(self.items) >= WebhookSender.QUEUE_MAX:
+                self.items.pop(0)
+                log_to_file(f"[WEBHOOK] Queue for {self.url} full, dropped the oldest event")
+            self.items.append([time.monotonic(), 0, payload, headers])
+            self.cond.notify()
+
+    def _post(self, payload, headers):
+        if self.session is None:
+            self.session, self.reused = requests.Session(), False
+        status = self.session.post(self.url, json=payload, headers=headers,
+                                   timeout=WebhookSender.TIMEOUT).status_code
+        self.reused = True
+        return status
+
+    def _reset(self):
+        if self.session is not None:
+            try:
+                self.session.close()
+            except Exception:
+                pass
+        self.session, self.reused = None, False
+
+    # One delivery. A connection error on a session that has delivered before is usually a
+    # kept-alive socket the target closed, so it is resent at once on a fresh connection;
+    # any other failure is queued again WEBHOOK_RETRY_DELAY later, up to WEBHOOK_RETRIES times.
+    def _deliver(self, item):
+        _, attempt, payload, headers = item
+        try:
+            try:
+                status = self._post(payload, headers)
+            except requests.exceptions.ConnectionError as e:
+                if not self.reused or isinstance(e, requests.exceptions.Timeout):
+                    raise
+                self._reset()
+                status = self._post(payload, headers)
+            if status < 300:
+                return
+            reason = f"HTTP {status}"
+        except Exception as e:
+            self._reset()
+            reason = str(e)
+        retrying = attempt < self.sender.retries
+        log_to_file(f"[WEBHOOK] POST to {self.url} failed ({reason})" +
+                    (f", retrying in {int(self.sender.retry_delay)}s" if retrying else ", giving up"))
+        if retrying:
+            with self.cond:
+                self.items.append([time.monotonic() + self.sender.retry_delay, attempt + 1, payload, headers])
+
+    def _run(self):
+        idle_since = time.monotonic()
+        while True:
+            with self.cond:
+                now = time.monotonic()
+                due = next((it for it in self.items if it[0] <= now), None)
+                if due is not None:
+                    self.items.remove(due)
+                elif self.items or now - idle_since < WebhookSender.IDLE_SECS:
+                    nxt = min((it[0] for it in self.items), default=idle_since + WebhookSender.IDLE_SECS)
+                    self.cond.wait(max(0.05, nxt - now))
+                    continue
+            if due is None:
+                # Idle long enough: leave, unless an event arrived meanwhile. Same lock order
+                # as WebhookSender.send (sender lock, then this target's condition).
+                with self.sender.lock, self.cond:
+                    if self.items:
+                        continue
+                    self.sender.targets.pop(self.url, None)
+                self._reset()
+                return
+            self._deliver(due)
+            idle_since = time.monotonic()
+
+
+class WebhookSender:
+    TIMEOUT = 8.0      # per request (connect and each read)
+    QUEUE_MAX = 100    # events waiting per target; the oldest is dropped beyond this
+    IDLE_SECS = 120.0  # a target idle this long closes its connection and its worker exits
+
+    def __init__(self, retries, retry_delay):
+        self.retries, self.retry_delay = retries, retry_delay
+        self.lock = threading.Lock()
+        self.targets = {}   # url -> _WebhookTarget
+
+    def send(self, url, payload, headers):
+        with self.lock:
+            target = self.targets.get(url)
+            if target is None:
+                target = self.targets[url] = _WebhookTarget(self, url)
+            target.put(payload, headers)
+
+
 class GPIOManager:
     def __init__(self):
         self._lock = threading.RLock()
+        self._webhook_sender = WebhookSender(self.WEBHOOK_RETRIES, self.WEBHOOK_RETRY_DELAY)
         self._revert_token: Dict[str, int] = {}
         self._last_edge: Dict[str, float] = {}
         self.config: dict = self._load_config()
@@ -1218,8 +1327,8 @@ class GPIOManager:
                 targets.append((url, {"Api-Key": key} if key else {}))
         return targets
 
-    # POSTs the pin's current info to every configured target on background threads
-    # (fire-and-forget - failures are logged but not retried or surfaced to the caller)
+    # Queues the pin's current info for every configured target; WebhookSender delivers it
+    # (in order per target, over a kept-alive connection, retried on failure)
     @_locked
     def _trigger_webhook(self, gpio: str):
         targets = self._notify_targets()
@@ -1232,39 +1341,16 @@ class GPIOManager:
         payload = {"agent": self.config.get("name") or _default_name(), **self.get_pin_info(gpio)}
         for url, headers in targets:
             log_to_file(f"[Webhook] GPIO {gpio} → {url}")
-            threading.Thread(target=self._post_webhook,
-                             args=(url, payload, headers), daemon=True).start()
+            self._webhook_sender.send(url, payload, headers)
 
     WEBHOOK_RETRIES = 2
     WEBHOOK_RETRY_DELAY = 30.0
-
-    @staticmethod
-    def _post_webhook(url: str, payload: dict, headers: dict, timeout: float = 8.0):
-        """One delivery attempt, then up to WEBHOOK_RETRIES more WEBHOOK_RETRY_DELAY apart.
-        A non-2xx answer counts as a failure too, not just a connection error: a bridge
-        that restarted answers 401 until it has re-pushed its key onto this agent, and the
-        retry is what gets that event through once it has. Runs on the caller's daemon
-        thread, so a failing target keeps one sleeping thread alive per event for about a
-        minute - bounded by the per-pin WEBHOOK_MIN_INTERVAL debounce."""
-        for attempt in range(GPIOManager.WEBHOOK_RETRIES + 1):
-            if attempt:
-                time.sleep(GPIOManager.WEBHOOK_RETRY_DELAY)
-            try:
-                status = requests.post(url, json=payload, headers=headers, timeout=timeout).status_code
-                if status < 300:
-                    return
-                reason = f"HTTP {status}"
-            except Exception as e:
-                reason = str(e)
-            retrying = attempt < GPIOManager.WEBHOOK_RETRIES
-            log_to_file(f"[WEBHOOK] POST to {url} failed ({reason})" +
-                        (f", retrying in {int(GPIOManager.WEBHOOK_RETRY_DELAY)}s" if retrying else ", giving up"))
 
     WEBHOOK_MIN_INTERVAL = 0.2
 
     # Edge-callback entry point (runs on gpiozero's callback thread). gpiozero's own
     # bounce_time (50 ms) still lets a chattering input fire ~20 webhooks/s, each
-    # spawning a thread - cap it at one per WEBHOOK_MIN_INTERVAL per pin.
+    # queued for delivery - cap it at one per WEBHOOK_MIN_INTERVAL per pin.
     @_locked
     def _on_edge(self, gpio: str):
         now = time.monotonic()
@@ -1629,8 +1715,7 @@ def run_server(host: str, port: int):
         payload = {"agent": manager.config.get("name") or _default_name(), "note": "Up and running"}
         for url, headers in boot_targets:
             log_to_file(f"[Webhook] Boot → {url}")
-            threading.Thread(target=GPIOManager._post_webhook,
-                             args=(url, payload, headers), daemon=True).start()
+            manager._webhook_sender.send(url, payload, headers)
 
     print(f"INFO:     Uvicorn running on http://{host}:{port} (Press CTRL+C to quit)" if False
           else f"INFO:     Lite server listening on http://{host}:{port}")

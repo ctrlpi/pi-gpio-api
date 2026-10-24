@@ -37,6 +37,9 @@ import tempfile
 import socket
 import shutil
 import subprocess
+import threading
+import importlib.util
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 def find_free_port():
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -428,15 +431,143 @@ class TestPiGpioApiMain(BasePiGpioApiTests, unittest.TestCase):
         cls.stop_server()
 
 
+class _WebhookSink(BaseHTTPRequestHandler):
+    """Keep-alive HTTP/1.1 sink for WebhookSender tests. Records (path, Api-Key, body, client
+    port) per delivery. /flaky answers 500 once; /drop closes the connection, without a reply,
+    on the second request it gets over one connection (a kept-alive socket the target dropped)."""
+    protocol_version = "HTTP/1.1"
+
+    def do_POST(self):
+        n = int(self.headers.get("Content-Length") or 0)
+        body = json.loads(self.rfile.read(n) or b"{}")
+        self.requests_on_conn = getattr(self, "requests_on_conn", 0) + 1
+        if self.path == "/drop" and self.requests_on_conn == 2:
+            self.close_connection = True
+            return
+        status = 200
+        if self.path == "/flaky" and not self.server.flaky_done:
+            self.server.flaky_done = True
+            status = 500
+        else:
+            self.server.received.append((self.path, self.headers.get("Api-Key"), body, self.client_address[1]))
+        self.send_response(status)
+        self.send_header("Content-Length", "2")
+        self.end_headers()
+        self.wfile.write(b"{}")
+
+    def log_message(self, *a):
+        pass
+
+
+class BaseWebhookSenderTests:
+    """WebhookSender: one worker and one kept-alive session per target URL."""
+    SERVER_FILE = None
+
+    @classmethod
+    def setUpClass(cls):
+        # Importing a server creates its GPIOManager, which writes config.json and agent.log
+        # into the current folder: keep that in a temporary one for the whole class.
+        cls.old_cwd = os.getcwd()
+        cls.temp_dir = tempfile.mkdtemp()
+        os.chdir(cls.temp_dir)
+        path = os.path.join(_script_dir, cls.SERVER_FILE)
+        spec = importlib.util.spec_from_file_location("srv_" + cls.SERVER_FILE.replace(".", "_"), path)
+        cls.mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.mod)
+        cls.sink = ThreadingHTTPServer(("127.0.0.1", 0), _WebhookSink)
+        cls.sink.received, cls.sink.flaky_done = [], False
+        threading.Thread(target=cls.sink.serve_forever, daemon=True).start()
+        cls.base = f"http://127.0.0.1:{cls.sink.server_address[1]}"
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.sink.shutdown()
+        os.chdir(cls.old_cwd)
+        shutil.rmtree(cls.temp_dir, ignore_errors=True)
+
+    def setUp(self):
+        self.sink.received.clear()
+
+    def wait_for(self, path, count, timeout=5):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            got = [r for r in self.sink.received if r[0] == path]
+            if len(got) >= count:
+                return got
+            time.sleep(0.05)
+        return [r for r in self.sink.received if r[0] == path]
+
+    def test_in_order_over_one_connection(self):
+        sender = self.mod.WebhookSender(2, 30)
+        for i in range(5):
+            sender.send(self.base + "/order", {"n": i}, {})
+        got = self.wait_for("/order", 5)
+        self.assertEqual([r[2]["n"] for r in got], list(range(5)))
+        self.assertEqual(len({r[3] for r in got}), 1, "expected one kept-alive connection")
+
+    def test_each_target_gets_only_its_own_key(self):
+        sender = self.mod.WebhookSender(2, 30)
+        sender.send(self.base + "/a", {"t": "a"}, {"Api-Key": "key-a"})
+        sender.send(self.base + "/b", {"t": "b"}, {"Api-Key": "key-b"})
+        sender.send(self.base + "/c", {"t": "c"}, {})
+        self.assertEqual(self.wait_for("/a", 1)[0][1], "key-a")
+        self.assertEqual(self.wait_for("/b", 1)[0][1], "key-b")
+        self.assertIsNone(self.wait_for("/c", 1)[0][1])
+        sender.send(self.base + "/a", {"t": "a2"}, {"Api-Key": "key-a"})
+        self.assertEqual([r[1] for r in self.wait_for("/a", 2)], ["key-a", "key-a"])
+
+    def test_failure_is_retried_after_the_delay(self):
+        self.sink.flaky_done = False
+        sender = self.mod.WebhookSender(2, 0.5)
+        sender.send(self.base + "/flaky", {"n": 1}, {})
+        self.assertEqual(self.wait_for("/flaky", 1, timeout=0.3), [])
+        got = self.wait_for("/flaky", 1, timeout=5)
+        self.assertEqual(len(got), 1)
+
+    def test_dropped_keepalive_connection_is_resent_at_once(self):
+        sender = self.mod.WebhookSender(2, 30)   # a queued retry would take 30 s
+        sender.send(self.base + "/drop", {"n": 1}, {})
+        sender.send(self.base + "/drop", {"n": 2}, {})
+        got = self.wait_for("/drop", 2, timeout=5)
+        self.assertEqual([r[2]["n"] for r in got], [1, 2])
+
+    def test_idle_target_closes_and_leaves(self):
+        cls = self.mod.WebhookSender
+        old, cls.IDLE_SECS = cls.IDLE_SECS, 0.3
+        try:
+            sender = cls(2, 30)
+            sender.send(self.base + "/idle", {"n": 1}, {})
+            self.wait_for("/idle", 1)
+            deadline = time.time() + 5
+            while time.time() < deadline and sender.targets:
+                time.sleep(0.05)
+            self.assertEqual(sender.targets, {})
+            sender.send(self.base + "/idle", {"n": 2}, {})   # comes back on demand
+            self.assertEqual(len(self.wait_for("/idle", 2)), 2)
+        finally:
+            cls.IDLE_SECS = old
+
+
+class TestWebhookSenderLite(BaseWebhookSenderTests, unittest.TestCase):
+    SERVER_FILE = "lite.py"
+
+
+@unittest.skipIf(not HAS_FASTAPI_AND_PYDANTIC, "fastapi and pydantic not installed; skipping main.py")
+class TestWebhookSenderMain(BaseWebhookSenderTests, unittest.TestCase):
+    SERVER_FILE = "main.py"
+
+
 if __name__ == "__main__":
     suite = unittest.TestSuite()
 
     # 1. First run tests on lite.py
     suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(TestPiGpioApiLite))
+    suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(TestWebhookSenderLite))
 
     # 2. Then check fastapi and pydantic, if both available, run against main.py
     if HAS_FASTAPI_AND_PYDANTIC:
         suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(TestPiGpioApiMain))
+        suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(TestWebhookSenderMain))
     else:
         print("Note: fastapi and/or pydantic not installed; skipping main.py tests.")
 

@@ -2,7 +2,9 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-**`README.md` is done.** Do not edit it without the user's explicit confirmation first, even for small wording/formatting fixes.
+## The README is locked
+
+`README.md` is done. Do not edit it without the user's explicit confirmation, even for a small wording or formatting fix, and even to keep it in sync with another project's README.
 
 ## What This Is
 
@@ -23,6 +25,14 @@ uvicorn main:app --host 0.0.0.0 --port 8314
 # Set and persist API key on startup
 python main.py --api-key your-secret-key --save
 ```
+
+## Tests
+
+`python test.py` (CI runs it on Ubuntu after `pip install -r requirements.txt`). It switches to `venv/` by itself when the
+outer Python lacks the packages. The same suite runs twice, against `lite.py` and against `main.py` (skipped when
+FastAPI/Pydantic are missing): each starts on a free loopback port with mock GPIO, inside a temporary folder so
+`config.json`, `status.json` and `agent.log` never touch the checkout. A test sensor script is staged in `scripts/` and
+removed afterwards. Live tests against a real Pi are `api-tester`'s job.
 
 ## Architecture
 
@@ -53,7 +63,7 @@ A second, self-contained server with the same REST API and no FastAPI/Pydantic/u
 - **Output config defaults**: Explicitly configuring a new `output` pin starts it at LOW (`0`) unless an `init` value is provided. 
 - **Removing an output pin**: Setting `type=remove` switches the pin to an un-pulled `input` before deleting it, ensuring it doesn't stay actively driven.
 - **Config persistence rules**: Configurations only store fields applicable to their type. For example, `pullup` is cleared on an `output` pin, and `watched` is only stored if true. 
-- **Watch/webhook flow**: `watch_pin` registers callbacks that POST pin state JSON to all configured targets in daemon threads. Delivery failures retry up to `WEBHOOK_RETRIES` times, delayed by `WEBHOOK_RETRY_DELAY`.
+- **Watch/webhook flow**: `watch_pin` registers callbacks; `_trigger_webhook()` queues the pin state JSON for every configured target on `WebhookSender` (the boot notice goes the same way). Each target URL gets one `_WebhookTarget`: its own worker thread, its own kept-alive `requests.Session`, and a queue, so its events go out in order and a dead target never delays another. Headers (the target's own `Api-Key`) go on each request, never on the session, so no key reaches another target. A connection error on a session that has delivered before (a kept-alive socket the target closed) is resent at once on a fresh connection; any other failure is queued again `WEBHOOK_RETRY_DELAY` (30 s) later, up to `WEBHOOK_RETRIES` (2) times, with the same `[WEBHOOK] POST to ... failed` log lines. A queue holds at most `QUEUE_MAX` (100) events (the oldest is dropped and logged), and a target idle for `IDLE_SECS` (120 s) closes its connection and its worker exits, so URLs that are no longer configured leave nothing behind. Why: a fresh HTTPS connection is slow on a small board. Measured on a Pi 1 A+, one cost ~3 s and three at once ~9 s each, past the ~10 s the hooks server allows for a handshake (`api-tester` test 33 failed there in full runs), while a reused one costs ~0.2 s. `TestWebhookSenderLite` / `TestWebhookSenderMain` cover order and one connection, per-target keys, the retry, the resend after a dropped connection and the idle exit.
 - **Sensors**: Scripts run via `["sh", scripts/<file>, *args]` with a 15-second timeout. Filenames must match `_SCRIPT_NAME_RE` and stay confined to the `scripts/` directory for security.
 - **`/hello` endpoint**: Bypasses auth and logging entirely to serve as a fast, quiet polling endpoint.
 - **Log retention**: Controlled by `config.log_days`. Setting to `0` clears the log immediately.
@@ -69,3 +79,7 @@ Stored in `config.settings`, runtime-togglable via `POST /config/update`:
 - `docs_enabled`: Toggles `/docs`, `/redoc`, and `/openapi.json` (default: `false`).
 - `logs_enabled`: Toggles writing to `agent.log` (default: `true`).
 - `log_days`: Retention in days (0-30, default: `7`).
+
+## Open items (future)
+
+- **A shorter first webhook retry** (e.g. 3 s, then 30 s), so a delivery whose first attempt fails still lands within seconds. Not done, because: (1) "retried twice, 30 s apart" is the shared rule in the root `CLAUDE.md`, and `pico-gpio-api` and `esp32-gpio-api` use 30 s too, so it would have to change in all three agents and in their locked READMEs; (2) a bridge answers `401` until it has pushed its new key, which it does off the first rejected event, so a 3 s retry may still be refused (the 30 s one lands); (3) a POST the server received whose reply was lost would be resent inside a test window, and `api-tester` tests 33/34 count deliveries exactly. Revisit only if the per-target kept-alive sender is not enough on the slowest Pis.
