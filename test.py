@@ -74,6 +74,11 @@ class BasePiGpioApiTests:
         with open(cls.test_script_path, "w") as f:
             f.write("#!/bin/sh\necho '{\"value\": 42}'\n")
         os.chmod(cls.test_script_path, 0o755)
+        # A .py sensor, run with the agent's own Python (no shebang, no executable bit)
+        cls.test_py_script_name = "test_ci_sensor.py"
+        cls.test_py_script_path = os.path.join(cls.sensor_dir, cls.test_py_script_name)
+        with open(cls.test_py_script_path, "w") as f:
+            f.write("import sys, json\nprint(json.dumps({'value': int(sys.argv[1]) * 2}))\n")
 
         # Start server process
         cmd = [
@@ -125,12 +130,13 @@ class BasePiGpioApiTests:
         if hasattr(cls, "temp_dir") and os.path.exists(cls.temp_dir):
             shutil.rmtree(cls.temp_dir, ignore_errors=True)
 
-        # Clean up test sensor script
-        if hasattr(cls, "test_script_path") and os.path.exists(cls.test_script_path):
-            try:
-                os.remove(cls.test_script_path)
-            except OSError:
-                pass
+        # Clean up test sensor scripts
+        for attr in ("test_script_path", "test_py_script_path"):
+            if hasattr(cls, attr) and os.path.exists(getattr(cls, attr)):
+                try:
+                    os.remove(getattr(cls, attr))
+                except OSError:
+                    pass
         if getattr(cls, "created_sensor_dir", False) and os.path.exists(cls.sensor_dir):
             try:
                 os.rmdir(cls.sensor_dir)
@@ -186,6 +192,49 @@ class BasePiGpioApiTests:
 
         # Restore
         requests.post(f"{self.base_url}/config/update", headers=self.headers, json={"log_days": 7}, timeout=3)
+
+    def test_bad_api_key_is_ignored(self):
+        """An empty, null or non-text api_key on /config/load or /config/update counts as no key:
+        the current key keeps working, and no empty, missing or default key gets in"""
+        url = f"{self.base_url}/config/read"
+        try:
+            for bad in ("", None, [], {}, True):
+                requests.post(f"{self.base_url}/config/load", headers=self.headers, json={"api_key": bad}, timeout=3)
+                requests.post(f"{self.base_url}/config/update", headers=self.headers, json={"api_key": bad}, timeout=3)
+                self.assertEqual(requests.get(url, headers=self.headers, timeout=3).status_code, 200, repr(bad))
+                for other in ({"Api-Key": ""}, {}, {"Api-Key": "your-secret-key"}):
+                    self.assertEqual(requests.get(url, headers=other, timeout=3).status_code, 403, f"{bad!r} {other}")
+        finally:
+            requests.post(f"{self.base_url}/config/update", headers=self.headers, json={"api_key": self.api_key}, timeout=3)
+
+    def test_bad_api_key_in_config_file_means_default(self):
+        """A config.json whose api_key is missing, empty, null or not text starts on the
+        default key, never with an open or locked agent"""
+        for stored in (None, "", "missing", ["x"]):
+            temp = tempfile.mkdtemp(prefix="pi_gpio_key_test_")
+            port = find_free_port()
+            config = {"name": "key-test"} if stored == "missing" else {"name": "key-test", "api_key": stored}
+            with open(os.path.join(temp, "config.json"), "w") as f:
+                json.dump(config, f)
+            proc = subprocess.Popen([sys.executable, self.script_path, "--port", str(port), "--local"],
+                                    cwd=temp, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            try:
+                base = f"http://127.0.0.1:{port}"
+                deadline = time.time() + 10
+                while time.time() < deadline:
+                    try:
+                        if requests.get(f"{base}/hello", timeout=0.5).status_code == 200:
+                            break
+                    except requests.RequestException:
+                        time.sleep(0.1)
+                url = f"{base}/config/read"
+                self.assertEqual(requests.get(url, headers={"Api-Key": "your-secret-key"}, timeout=3).status_code, 200, repr(stored))
+                for other in ({"Api-Key": ""}, {}):
+                    self.assertEqual(requests.get(url, headers=other, timeout=3).status_code, 403, f"{stored!r} {other}")
+            finally:
+                proc.terminate()
+                proc.wait(timeout=5)
+                shutil.rmtree(temp, ignore_errors=True)
 
     def test_numbers_stored_as_text(self):
         """A number sent for a key, name, URL or script is stored as text"""
@@ -366,6 +415,20 @@ class BasePiGpioApiTests:
         r_gone = requests.get(f"{self.base_url}/sensor/read/test_sens", headers=self.headers, timeout=3)
         self.assertEqual(r_gone.status_code, 404)
 
+    def test_sensor_python_script(self):
+        """A .py sensor script runs with Python and gets its args"""
+        r_cfg = requests.post(
+            f"{self.base_url}/sensor/config/test_py_sens",
+            headers=self.headers,
+            json={"script": f"{self.test_py_script_name} 21"},
+            timeout=3
+        )
+        self.assertEqual(r_cfg.status_code, 200)
+        r_read = requests.get(f"{self.base_url}/sensor/read/test_py_sens", headers=self.headers, timeout=3)
+        self.assertEqual(r_read.status_code, 200)
+        self.assertEqual(r_read.json().get("test_py_sens"), 42)
+        requests.post(f"{self.base_url}/sensor/config/test_py_sens", headers=self.headers, json={"remove": True}, timeout=3)
+
     def test_sensor_security_path_traversal(self):
         """Sensor configuration rejects path traversal attempts with 400"""
         for bad in ["../main.py", "/bin/sh", "/etc/passwd", "scripts/test.sh", ".hidden"]:
@@ -392,6 +455,141 @@ class BasePiGpioApiTests:
             )
             self.assertEqual(r.status_code, 400, f"Expected 400 for injection: {bad}")
 
+    def _script(self, action, name, body=None, headers=None):
+        url = f"{self.base_url}/script/{action}/{name}"
+        if action == "read":
+            return requests.get(url, headers=headers or self.headers, timeout=5)
+        return requests.post(url, headers=headers or self.headers, json=body, timeout=5)
+
+    def test_script_write_list_read_run_remove(self):
+        """/script/* writes, lists, reads, runs (.py with Python, others with sh) and removes a script"""
+        py_name, sh_name = "test_ci_script.py", "test_ci_script.sh"
+        py_src = "import sys\nprint('hi ' + ' '.join(sys.argv[1:]))\n"
+        try:
+            r = self._script("write", py_name, {"content": py_src})
+            self.assertEqual(r.status_code, 200)
+            self.assertEqual(r.json(), {"name": py_name, "size": len(py_src)})
+
+            r = requests.get(f"{self.base_url}/script/list", headers=self.headers, timeout=3)
+            self.assertEqual(r.status_code, 200)
+            self.assertEqual(r.json()["write"], "enabled")
+            entry = next(e for e in r.json()["scripts"] if e["name"] == py_name)
+            self.assertEqual(entry["size"], len(py_src))
+            self.assertRegex(entry["modified"], r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$")
+
+            r = self._script("read", py_name)
+            self.assertEqual(r.status_code, 200)
+            self.assertEqual(r.json(), {"name": py_name, "content": py_src})
+
+            r = self._script("run", py_name, {"args": ["a1", 22]})
+            self.assertEqual(r.status_code, 200)
+            self.assertEqual(r.json(), {"name": py_name, "exit_code": 0, "output": "hi a1 22"})
+
+            # Windows line endings and non-ASCII text come back exactly; size counts bytes
+            crlf = "# 21.5 \u00b0C\r\nline two\r\nno final newline"
+            r = self._script("write", py_name, {"content": crlf})
+            self.assertEqual(r.json()["size"], len(crlf.encode("utf-8")))
+            self.assertEqual(self._script("read", py_name).json()["content"], crlf)
+
+            # Overwrite, then a shell script with a non-zero exit code and no body
+            self.assertEqual(self._script("write", py_name, {"content": "print('v2')\n"}).status_code, 200)
+            self.assertEqual(self._script("run", py_name).json()["output"], "v2")
+            self.assertEqual(self._script("write", sh_name, {"content": "echo out\nexit 3\n"}).status_code, 200)
+            r = requests.post(f"{self.base_url}/script/run/{sh_name}", headers=self.headers, timeout=5)
+            self.assertEqual(r.status_code, 200)
+            self.assertEqual(r.json(), {"name": sh_name, "exit_code": 3, "output": "out"})
+
+            r = self._script("write", py_name, {"remove": True})
+            self.assertEqual(r.json(), {"name": py_name, "status": "removed"})
+            self.assertEqual(self._script("read", py_name).status_code, 404)
+            self.assertEqual(self._script("run", py_name).status_code, 404)
+            self.assertEqual(self._script("write", py_name, {"remove": True}).json()["status"], "not found")
+        finally:
+            for n in (py_name, sh_name):
+                p = os.path.join(self.sensor_dir, n)
+                if os.path.exists(p):
+                    os.remove(p)
+
+    def test_script_write_refused_with_default_key(self):
+        """/script/write answers 403 while api_key is the shipped default"""
+        default = {"Api-Key": "your-secret-key"}
+        self.assertEqual(requests.post(f"{self.base_url}/config/update", headers=self.headers,
+                                       json={"api_key": "your-secret-key"}, timeout=3).status_code, 200)
+        try:
+            self.assertEqual(self._script("write", "test_ci_default.sh", {"content": "echo x"}, default).status_code, 403)
+            r = requests.get(f"{self.base_url}/script/list", headers=default, timeout=3)
+            self.assertEqual(r.json()["write"], "default_key")
+            self.assertFalse(os.path.exists(os.path.join(self.sensor_dir, "test_ci_default.sh")))
+        finally:
+            requests.post(f"{self.base_url}/config/update", headers=default, json={"api_key": self.api_key}, timeout=3)
+
+    def test_script_write_lock(self):
+        """/script/write can create write.lock, which then blocks every write and can't be changed or removed"""
+        lock = os.path.join(self.sensor_dir, "write.lock")
+        for name in ("write.lock", "WRITE.LOCK", "Write.Lock"):
+            self.assertEqual(self._script("run", name).status_code, 400, name)
+        self.assertFalse(os.path.exists(lock))
+        try:
+            r = self._script("write", "write.lock", {"content": "locked by the API"})
+            self.assertEqual(r.status_code, 200)
+            self.assertTrue(os.path.exists(lock))
+            r = requests.get(f"{self.base_url}/script/list", headers=self.headers, timeout=3)
+            self.assertEqual(r.json()["write"], "locked")
+            self.assertIn("write.lock", [e["name"] for e in r.json()["scripts"]])
+            self.assertEqual(self._script("write", "test_ci_locked.sh", {"content": "echo x"}).status_code, 403)
+            self.assertEqual(self._script("write", self.test_script_name, {"remove": True}).status_code, 403)
+            self.assertEqual(self._script("write", "write.lock", {"remove": True}).status_code, 403)
+            self.assertEqual(self._script("write", "write.lock", {"content": ""}).status_code, 403)
+            self.assertEqual(self._script("run", "write.lock").status_code, 400)
+            self.assertTrue(os.path.exists(lock))
+            self.assertTrue(os.path.exists(self.test_script_path))
+            self.assertFalse(os.path.exists(os.path.join(self.sensor_dir, "test_ci_locked.sh")))
+            # Reads and runs still work while locked
+            self.assertEqual(self._script("read", "write.lock").json()["content"], "locked by the API")
+            self.assertEqual(self._script("read", self.test_script_name).status_code, 200)
+            self.assertEqual(self._script("run", self.test_script_name).json()["exit_code"], 0)
+        finally:
+            if os.path.exists(lock):
+                os.remove(lock)
+
+    def test_script_bad_names_and_args(self):
+        """/script/* rejects paths, hidden names and non-alphanumeric args"""
+        # main.py's router decodes %2F first: a 404 there, a 400 in lite.py.
+        for action in ("read", "write", "run"):
+            self.assertIn(self._script(action, "..%2Fmain.py", {"content": "x"}).status_code, (400, 404))
+        for bad in [".hidden", "a%20b", "a..%5Cb"]:
+            self.assertEqual(self._script("read", bad).status_code, 400, bad)
+            self.assertEqual(self._script("write", bad, {"content": "x"}).status_code, 400, bad)
+            self.assertEqual(self._script("run", bad).status_code, 400, bad)
+        for bad in ["a%5Cb.sh", "-rf", "x%00.sh", "x" * 33]:
+            self.assertEqual(self._script("write", bad, {"content": "x"}).status_code, 400, bad)
+        # A subfolder is never listed, read, written or run
+        sub = os.path.join(self.sensor_dir, "test_ci_dir")
+        os.makedirs(sub, exist_ok=True)
+        try:
+            for action in ("read", "write", "run"):
+                self.assertEqual(self._script(action, "test_ci_dir", {"content": "x"}).status_code, 400, action)
+            r = requests.get(f"{self.base_url}/script/list", headers=self.headers, timeout=3)
+            self.assertNotIn("test_ci_dir", [e["name"] for e in r.json()["scripts"]])
+            self.assertEqual(os.listdir(sub), [])
+        finally:
+            os.rmdir(sub)
+        self.assertEqual(self._script("run", self.test_script_name, {"args": ["a;b"]}).status_code, 400)
+        self.assertEqual(self._script("run", self.test_script_name, {"args": "a"}).status_code, 422)
+        self.assertEqual(self._script("write", "test_ci_x.sh", {}).status_code, 400)
+        self.assertEqual(self._script("read", "test_ci_missing.sh").status_code, 404)
+        # 32 characters is the longest name accepted
+        long_name = "test_ci_" + "x" * 21 + "." + "sh"
+        self.assertEqual(len(long_name), 32)
+        try:
+            self.assertEqual(self._script("write", long_name, {"content": "echo x"}).status_code, 200)
+            self.assertEqual(self._script("read", long_name).status_code, 200)
+        finally:
+            p = os.path.join(self.sensor_dir, long_name)
+            if os.path.exists(p):
+                os.remove(p)
+        self.assertEqual(requests.get(f"{self.base_url}/script/list", timeout=3).status_code, 403)
+
     def test_logs(self):
         """GET /logs returns log tail list"""
         r = requests.get(f"{self.base_url}/logs", headers=self.headers, timeout=3)
@@ -404,6 +602,51 @@ class BasePiGpioApiTests:
         huge_data = {"dummy": "x" * 20000}
         r = requests.post(f"{self.base_url}/config/load", headers=self.headers, json=huge_data, timeout=3)
         self.assertEqual(r.status_code, 413)
+
+    def test_body_near_cap_accepted(self):
+        """A body just under the 16KB cap is read whole and accepted"""
+        r = requests.post(f"{self.base_url}/config/update", headers=self.headers, json={"padding": "x" * 16000}, timeout=3)
+        self.assertEqual(r.status_code, 200)
+
+    def _chunked_update(self, chunks):
+        """POST /config/update as a chunked body (headers first, then the chunks); returns the raw reply.
+        Connection: close makes the server close once it has answered, which ends the read. No
+        half-close (shutdown SHUT_WR) before reading: uvicorn takes it as the client leaving and
+        drops its reply, and no real client does it."""
+        with socket.create_connection(("127.0.0.1", self.port), timeout=5) as s:
+            s.sendall((f"POST /config/update HTTP/1.1\r\nHost: 127.0.0.1\r\nApi-Key: {self.api_key}\r\n"
+                       "Content-Type: application/json\r\nConnection: close\r\nTransfer-Encoding: chunked\r\n\r\n").encode())
+            time.sleep(0.2)
+            reply = b""
+            try:
+                s.sendall(b"".join(b"%x\r\n" % len(c) + c + b"\r\n" for c in chunks) + b"0\r\n\r\n")
+                while True:
+                    part = s.recv(4096)
+                    if not part:
+                        break
+                    reply += part
+            except ConnectionError:
+                pass    # a refused body may be answered and closed before it is all sent
+            return reply
+
+    def test_chunked_body_decoded(self):
+        """A chunked body is decoded and applied; one over the 16KB cap is refused (413) and applied nowhere"""
+        name = requests.get(f"{self.base_url}/config/read", headers=self.headers, timeout=3).json().get("name")
+        try:
+            body = json.dumps({"name": "chunked-ok"}).encode()
+            reply = self._chunked_update([body[:7], body[7:]])
+            self.assertTrue(reply.startswith(b"HTTP/1.1 200"), reply[:60])
+            cfg = requests.get(f"{self.base_url}/config/read", headers=self.headers, timeout=3).json()
+            self.assertEqual(cfg.get("name"), "chunked-ok")
+
+            body = json.dumps({"name": "chunked-big", "padding": "x" * 20000}).encode()
+            reply = self._chunked_update([body[i:i + 4000] for i in range(0, len(body), 4000)])
+            if reply:
+                self.assertTrue(reply.startswith(b"HTTP/1.1 413"), reply[:60])
+            cfg = requests.get(f"{self.base_url}/config/read", headers=self.headers, timeout=3).json()
+            self.assertEqual(cfg.get("name"), "chunked-ok")
+        finally:
+            requests.post(f"{self.base_url}/config/update", headers=self.headers, json={"name": name}, timeout=3)
 
 
 class TestPiGpioApiLite(BasePiGpioApiTests, unittest.TestCase):
@@ -557,17 +800,64 @@ class TestWebhookSenderMain(BaseWebhookSenderTests, unittest.TestCase):
     SERVER_FILE = "main.py"
 
 
+class BaseScanShapeTests:
+    """/gpio/scan entries: `value` and `reversed` only on a reversed pin. The route answers
+    422 off-Pi, so scan_all() is called directly with get_pin_info() faked."""
+    SERVER_FILE = None
+
+    @classmethod
+    def setUpClass(cls):
+        cls.old_cwd = os.getcwd()
+        cls.temp_dir = tempfile.mkdtemp()
+        os.chdir(cls.temp_dir)
+        path = os.path.join(_script_dir, cls.SERVER_FILE)
+        spec = importlib.util.spec_from_file_location("scan_" + cls.SERVER_FILE.replace(".", "_"), path)
+        cls.mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.mod)
+
+    @classmethod
+    def tearDownClass(cls):
+        os.chdir(cls.old_cwd)
+        shutil.rmtree(cls.temp_dir, ignore_errors=True)
+
+    def test_value_and_reversed_only_on_a_reversed_pin(self):
+        pins = {"5":  {"gpio": 5,  "value": 1, "level": 1, "type": "input", "pullup": "up"},
+                "26": {"gpio": 26, "value": 1, "level": 0, "type": "output", "name": "relay", "reversed": True}}
+        def fake_info(gpio, show_level=False):
+            return dict(pins[gpio])   # any other pin raises, and scan_all() skips it
+        manager = self.mod.manager
+        manager.get_pin_info = fake_info
+        try:
+            entries = {e["gpio"]: e for e in manager.scan_all()}
+        finally:
+            del manager.get_pin_info
+        self.assertEqual(entries[5], {"gpio": 5, "level": 1, "type": "input", "pullup": "up"})
+        self.assertEqual(entries[26], {"gpio": 26, "level": 0, "type": "output", "name": "relay",
+                                       "value": 1, "reversed": True})
+
+
+class TestScanShapeLite(BaseScanShapeTests, unittest.TestCase):
+    SERVER_FILE = "lite.py"
+
+
+@unittest.skipIf(not HAS_FASTAPI_AND_PYDANTIC, "fastapi and pydantic not installed; skipping main.py")
+class TestScanShapeMain(BaseScanShapeTests, unittest.TestCase):
+    SERVER_FILE = "main.py"
+
+
 if __name__ == "__main__":
     suite = unittest.TestSuite()
 
     # 1. First run tests on lite.py
     suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(TestPiGpioApiLite))
     suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(TestWebhookSenderLite))
+    suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(TestScanShapeLite))
 
     # 2. Then check fastapi and pydantic, if both available, run against main.py
     if HAS_FASTAPI_AND_PYDANTIC:
         suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(TestPiGpioApiMain))
         suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(TestWebhookSenderMain))
+        suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(TestScanShapeMain))
     else:
         print("Note: fastapi and/or pydantic not installed; skipping main.py tests.")
 

@@ -25,7 +25,7 @@ except ModuleNotFoundError as e:
     print("  or use: run.sh to create/enable a virtual environment (venv) and start")
     raise SystemExit(1)
 
-VERSION = "0.9.27"  # agent software version (kept in lockstep with pico-gpio-api); surfaced in /config/read
+VERSION = "0.9.30"  # agent software version (kept in lockstep with pico-gpio-api); surfaced in /config/read
 IS_PI = os.path.exists("/proc/device-tree/model")  # only real Pi hardware exposes this
 _PI_GPIO_PINS = [str(p) for p in range(2, 28)]  # usable BCM range (2-27)
 # GPIO 2 and 3 have fixed hardware pull-ups on all Pi boards.
@@ -321,6 +321,13 @@ def _normalize_config(data: dict) -> dict:
 def _as_text(v):
     return str(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else v
 
+# A usable api_key is non-empty text (a number counts, as text). Anything else, empty,
+# null or another type, counts as no key: the default on load, the current key on
+# /config/load, ignored on /config/update.
+def _valid_key(v):
+    v = _as_text(v)
+    return v if isinstance(v, str) and v else None
+
 def _text_fields(out):
     for k in ("name", "api_key"):
         if k in out:
@@ -359,6 +366,126 @@ def _validate_sensor_script(script: Optional[str]) -> Optional[str]:
     if os.path.exists(path) and not os.path.isfile(path):
         return "not a regular file"
     return None
+
+
+# --- Scripts (/script/list, /script/read, /script/write, /script/run) ---
+# The files in SENSOR_SCRIPTS_DIR. A name is a bare filename (the sensor rule). Writes are
+# refused (403) on the default api_key and while scripts/write.lock exists; a write may
+# create the lock but not change or remove it. Runs are not locked.
+SCRIPT_LOCK_FILE = "write.lock"
+SCRIPT_DEFAULT_KEY = "your-secret-key"
+SCRIPT_TIMEOUT = 15.0     # seconds a run may take before it's killed (504)
+SCRIPT_OUTPUT_CAP = 2048  # max chars of stdout a run returns
+SCRIPT_NAME_MAX = 32      # longest name accepted
+
+class ScriptError(Exception):
+    def __init__(self, status: int, message: str):
+        super().__init__(message)
+        self.status = status
+
+def _script_path(name: str) -> str:
+    if not _SCRIPT_NAME_RE.fullmatch(name or ""):
+        raise ScriptError(400, "script must be a bare filename in the scripts folder")
+    if len(name) > SCRIPT_NAME_MAX:
+        raise ScriptError(400, f"script name over {SCRIPT_NAME_MAX} characters")
+    path = os.path.join(SENSOR_SCRIPTS_DIR, name)
+    if os.path.exists(path) and not os.path.isfile(path):
+        raise ScriptError(400, "not a regular file")
+    return path
+
+# write.lock, in any letter case, is never run (WRITE.LOCK is the same file on a case-insensitive disk).
+def _is_lock_file(name: str) -> bool:
+    return name.lower() == SCRIPT_LOCK_FILE
+
+def _script_write_state(api_key: str) -> str:
+    if os.path.exists(os.path.join(SENSOR_SCRIPTS_DIR, SCRIPT_LOCK_FILE)):
+        return "locked"
+    if api_key == SCRIPT_DEFAULT_KEY:
+        return "default_key"
+    return "enabled"
+
+def list_scripts(api_key: str) -> dict:
+    try:
+        names = sorted(os.listdir(SENSOR_SCRIPTS_DIR))
+    except OSError:
+        names = []
+    scripts = []
+    for name in names:
+        path = os.path.join(SENSOR_SCRIPTS_DIR, name)
+        if _SCRIPT_NAME_RE.fullmatch(name) and os.path.isfile(path):
+            st = os.stat(path)
+            scripts.append({"name": name, "size": st.st_size,
+                            "modified": time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(st.st_mtime))})
+    return {"scripts": scripts, "write": _script_write_state(api_key)}
+
+def read_script(name: str) -> dict:
+    path = _script_path(name)
+    if not os.path.isfile(path):
+        raise ScriptError(404, f"Script not found: {name}")
+    # newline="": the text comes back exactly as written, \r\n included.
+    with open(path, encoding="utf-8", errors="replace", newline="") as f:
+        return {"name": name, "content": f.read()}
+
+def write_script(name: str, body: dict, api_key: str) -> dict:
+    path = _script_path(name)
+    state = _script_write_state(api_key)
+    if state == "locked":
+        raise ScriptError(403, "script writes are locked (write.lock in scripts/)")
+    if state == "default_key":
+        raise ScriptError(403, "script writes need an api_key other than the default")
+    if body.get("remove"):
+        existed = os.path.isfile(path)
+        if existed:
+            os.remove(path)
+            log_to_file(f"[Script] {name} removed")
+        return {"name": name, "status": "removed" if existed else "not found"}
+    content = _as_text(body.get("content"))
+    if content is None:
+        raise ScriptError(400, "Send 'content' (text), or 'remove': true to delete the script")
+    if not isinstance(content, str):
+        raise ScriptError(422, "Request body failed validation")
+    # Written to a hidden temp file and moved into place, so a run never sees half a script.
+    os.makedirs(SENSOR_SCRIPTS_DIR, exist_ok=True)
+    tmp = os.path.join(SENSOR_SCRIPTS_DIR, f".{name}.tmp")
+    with open(tmp, "w", encoding="utf-8", newline="") as f:
+        f.write(content)
+    os.replace(tmp, path)
+    size = os.path.getsize(path)
+    log_to_file(f"[Script] {name} written ({size} bytes)")
+    return {"name": name, "size": size}
+
+def run_script(name: str, body: dict) -> dict:
+    path = _script_path(name)
+    if _is_lock_file(name):
+        raise ScriptError(400, "write.lock is not a script")
+    if not os.path.isfile(path):
+        raise ScriptError(404, f"Script not found: {name}")
+    # A wrong type is 422, as pydantic answers it in main.py; a bad character is 400.
+    args = body.get("args") or []
+    if not isinstance(args, list):
+        raise ScriptError(422, "Request body failed validation")
+    args = [_as_text(a) for a in args]
+    if any(not isinstance(a, str) for a in args):
+        raise ScriptError(422, "Request body failed validation")
+    if any(not re.fullmatch(r"[A-Za-z0-9]+", a) for a in args):
+        raise ScriptError(400, "script args must be letters and digits only")
+    # Run like a sensor: `sh scripts/<file> <args>`, or the agent's own Python for a `.py`
+    # file, in its own process group so a timeout kills it with any children.
+    runner = sys.executable if name.endswith(".py") else "sh"
+    proc = subprocess.Popen([runner, path, *args], stdout=subprocess.PIPE,
+                            stderr=subprocess.DEVNULL, text=True, start_new_session=True)
+    try:
+        stdout, _ = proc.communicate(timeout=SCRIPT_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except OSError:
+            pass
+        proc.wait()
+        log_to_file(f"[Script] {name} timed out")
+        raise ScriptError(504, "script timed out")
+    log_to_file(f"[Script] {name} run, exit code {proc.returncode}")
+    return {"name": name, "exit_code": proc.returncode, "output": stdout[:SCRIPT_OUTPUT_CAP].rstrip()}
 
 
 # --- Logging ---
@@ -643,7 +770,7 @@ class GPIOManager:
     def _build_config(self, data: dict) -> dict:
         if not isinstance(data, dict):
             data = {}
-        data.setdefault("api_key", "your-secret-key")
+        data["api_key"] = _valid_key(data.get("api_key")) or "your-secret-key"
         data.setdefault("name", None)
         data.setdefault("notifications", {})
         data.setdefault("bridges", {})
@@ -1088,10 +1215,10 @@ class GPIOManager:
         for gpio in _PI_GPIO_PINS:
             try:
                 info = self.get_pin_info(gpio, show_level=True)
+                # `value` equals `level` unless the pin is reversed, so both are sent only then.
                 entry = {
                     "gpio": info["gpio"],
                     "level": info["level"],
-                    "value": info["value"],
                     "type": info["type"],
                 }
                 if info.get("name"):
@@ -1099,6 +1226,7 @@ class GPIOManager:
                 if info.get("pullup"):
                     entry["pullup"] = info["pullup"]
                 if info.get("reversed") is True:
+                    entry["value"] = info["value"]
                     entry["reversed"] = True
                 result.append(entry)
             except Exception:
@@ -1208,7 +1336,8 @@ class GPIOManager:
         path = os.path.join(SENSOR_SCRIPTS_DIR, script)
         if not os.path.isfile(path):
             return {name: "script not found"}
-        proc = subprocess.Popen(["sh", path, *args], stdout=subprocess.PIPE,
+        runner = sys.executable if script.endswith(".py") else "sh"
+        proc = subprocess.Popen([runner, path, *args], stdout=subprocess.PIPE,
                                 stderr=subprocess.DEVNULL, text=True, start_new_session=True)
         try:
             stdout, _ = proc.communicate(timeout=self.SENSOR_TIMEOUT)
@@ -1258,8 +1387,8 @@ class GPIOManager:
         self._backup_config()
         for k, v in _normalize_config(update).items():
             if k == "api_key":
-                if v:
-                    self.config["api_key"] = v
+                if _valid_key(v):
+                    self.config["api_key"] = _valid_key(v)
             elif k in ("notifications", "bridges"):
                 group = self.config.setdefault(k, {})
                 for gk, gv in (v or {}).items():
@@ -1288,7 +1417,7 @@ class GPIOManager:
     def load_config(self, data: dict) -> None:
         self._backup_config()
         data = _normalize_config(data) if isinstance(data, dict) else {}
-        data.setdefault("api_key", self.api_key)
+        data["api_key"] = _valid_key(data.get("api_key")) or self.api_key
         _atomic_write_json(CONFIG_FILE, data)
         self._reload()
 
@@ -1404,7 +1533,7 @@ threading.Thread(target=_log_cleanup_loop, daemon=True).start()
 _STATUS_TEXT = {
     200: "OK", 400: "Bad Request", 403: "Forbidden",
     404: "Not Found", 413: "Payload Too Large", 422: "Unprocessable Entity",
-    500: "Internal Server Error",
+    500: "Internal Server Error", 504: "Gateway Timeout",
 }
 
 # Sends a status line with no body: the empty 404 every unknown route or pin gets.
@@ -1499,6 +1628,14 @@ def _recv_chunked(conn, data, sep):
         if not chunk:
             return bad
         buf += chunk
+
+# A missing script answers the empty 404 every unknown name gets; any other refusal
+# carries its reason.
+def _send_script_error(conn, e):
+    if e.status == 404:
+        _send_empty(conn, 404)
+    else:
+        _send_json(conn, {"error": str(e)}, e.status)
 
 # Splits a raw request into (method, path, query, headers, body). body is {} when the
 # request has none and None when it isn't a JSON object, which the caller answers 422.
@@ -1621,6 +1758,29 @@ def handle_request(conn, manager: GPIOManager):
                 _send_json(conn, manager.read_sensor(sensor_name))
             except ValueError as e:
                 _send_empty(conn, 404)
+        elif method == "GET" and path == "/script/list":
+            _send_json(conn, list_scripts(manager.api_key))
+        elif method == "GET" and path.startswith("/script/read/"):
+            try:
+                _send_json(conn, read_script(path[len("/script/read/"):]))
+            except ScriptError as e:
+                _send_script_error(conn, e)
+        elif method == "POST" and path.startswith("/script/write/"):
+            if not isinstance(body, dict):
+                _send_json(conn, {"error": "Request body failed validation"}, 422)
+                return
+            try:
+                _send_json(conn, write_script(path[len("/script/write/"):], body, manager.api_key))
+            except ScriptError as e:
+                _send_script_error(conn, e)
+        elif method == "POST" and path.startswith("/script/run/"):
+            if not isinstance(body, dict):
+                _send_json(conn, {"error": "Request body failed validation"}, 422)
+                return
+            try:
+                _send_json(conn, run_script(path[len("/script/run/"):], body))
+            except ScriptError as e:
+                _send_script_error(conn, e)
         elif method == "GET" and path == "/gpio/scan":
             if not IS_PI:
                 _send_json(conn, {"agent": manager._agent_info(), "error": "Platform does not support GPIOs"}, 422)

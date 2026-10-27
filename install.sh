@@ -4,6 +4,7 @@
 # Downloads the release files (no git required) and (re)installs venv dependencies.
 # Creates scripts/ with a cpu-temp.sh example. Downloads only when piped into a shell
 # or run with --upgrade. Prompts for an API key + agent name on first install (-y for defaults).
+# --unlock installs nothing: it only deletes scripts/write.lock, re-enabling /script/write.
 set -e
 
 BASE_URL="https://raw.githubusercontent.com/ctrlpi/pi-gpio-api/main"
@@ -22,12 +23,33 @@ done
 ASSUME_YES=false
 LITE=false
 FULL=false
+UNLOCK=false
 for arg in "$@"; do
   [ "$arg" = "--upgrade" ] && DOWNLOAD=true
   [ "$arg" = "-y" ] && ASSUME_YES=true
   [ "$arg" = "--lite" ] && LITE=true
   [ "$arg" = "--full" ] && FULL=true
+  [ "$arg" = "--unlock" ] && UNLOCK=true
 done
+
+# --unlock: only delete scripts/write.lock (/script/write can create it, never remove it), then stop.
+if [ "$UNLOCK" = true ]; then
+  if [ "$(basename "$PWD")" = "$DIR" ] || { [ -f main.py ] && [ -f install.sh ]; }; then
+    DIR="."
+  fi
+  if [ ! -f "$DIR/main.py" ] && [ ! -f "$DIR/lite.py" ]; then
+    echo "Error: no pi-gpio-api install here. Run it from the pi-gpio-api folder or the one holding it." >&2
+    exit 1
+  fi
+  LOCK="$DIR/scripts/write.lock"
+  if [ -f "$LOCK" ]; then
+    rm "$LOCK"
+    echo "Removed $LOCK: script writes are unlocked."
+  else
+    echo "No $LOCK: script writes were not locked."
+  fi
+  exit 0
+fi
 
 if [ "$DOWNLOAD" = true ] && ! command -v curl >/dev/null 2>&1; then
   echo "Error: curl is required. Install it first (e.g. sudo apt install curl)." >&2

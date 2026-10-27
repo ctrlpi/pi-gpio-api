@@ -1,7 +1,7 @@
 # Raspberry Pi GPIO API
 
 [![Platform: Raspberry Pi](https://img.shields.io/badge/platform-Raspberry%20Pi-006400.svg)](#install-on-your-pi)
-[![Version 0.9.27](https://img.shields.io/badge/version-0.9.27-blue.svg)](https://github.com/ctrlpi/pi-gpio-api/tags)
+[![Version 0.9.30](https://img.shields.io/badge/version-0.9.30-blue.svg)](https://github.com/ctrlpi/pi-gpio-api/tags)
 [![Python 3.9+](https://img.shields.io/badge/python-3.9%2B-blue.svg)](https://www.python.org/)
 [![Auth: Api-Key](https://img.shields.io/badge/auth-Api--Key-orange.svg)](#authentication)
 [![License: MIT](https://img.shields.io/badge/license-MIT-188038.svg)](LICENSE)
@@ -194,7 +194,7 @@ The core of the API: read, write, configure, and watch GPIO pins. Every pin is a
 | `POST` | `/gpio/write/{name_or_gpio}` | Write a value to a pin |
 | `POST` | `/gpio/config/{name_or_gpio}` | Configure a pin (name, type, init, pullup, max, reversed, watched) |
 | `GET` | `/gpio/watched` | List all currently watched pins, the active webhook URL, and the `bridges` callback URLs (URLs only, never the keys) |
-| `GET` | `/gpio/scan` | Scan all BCM GPIO pins (Pi hardware only). Returns `level` (the physical state) and `value` (logical). Also returns the live `agent` block; the pin list is keyed `gpios`. |
+| `GET` | `/gpio/scan` | Scan all BCM GPIO pins (Pi hardware only). Returns `level` (the physical state) for every pin, and `value` (logical) and `reversed` only for a reversed pin. Also returns the live `agent` block; the pin list is keyed `gpios`. |
 
 ### Request Bodies
 
@@ -270,11 +270,11 @@ Sensors are pure config plus on-demand reads: no pins, no background polling, no
 
 ### Configure
 
-Scripts live in the **`scripts/` folder next to `main.py`**. `install.sh` creates it and seeds it with a one-line `cpu-temp.sh` example; drop your own scripts in beside it (the agent itself never creates the folder - with no folder, every sensor just reads `script not found`).
+Scripts live in the **`scripts/` folder next to `main.py`**. `install.sh` creates it and seeds it with a one-line `cpu-temp.sh` example; drop your own scripts in beside it, or write them over the API (see [Scripts](#scripts)). The agent creates the folder only on a `/script/write`; with no folder, every sensor just reads `script not found`.
 
-Scripts can have arguments as `"<file> [args...]"`, where the file is a **bare filename** in `scripts/`: no paths, no `..`, no leading dot, no subfolders. It's always run as `sh scripts/<file> <args>` with a 15-second timeout, and its **stdout** (first 2 KB) is the reading, so it needs no `./` prefix, no executable bit, and nothing on `PATH`. Arguments may contain letters and digits only. Inline shell commands are **not** accepted: nothing is ever parsed by a shell, so pipes, redirects, and command substitution cannot be injected through the API.
+Scripts can have arguments as `"<file> [args...]"`, where the file is a **bare filename** in `scripts/`: no paths, no `..`, no leading dot, no subfolders. It's run as `sh scripts/<file> <args>` (a `.py` file runs with the agent's own Python instead) with a 15-second timeout, and its **stdout** (first 2 KB) is the reading, so it needs no `./` prefix, no executable bit, and nothing on `PATH`. Arguments may contain letters and digits only. Inline shell commands are **not** accepted: nothing is ever parsed by a shell, so pipes, redirects, and command substitution cannot be injected through the API.
 
-`scripts/` is the **only** folder a sensor can run anything from. That folder is hardcoded (no config field or API call can widen it), so a holder of the API key can never point a sensor at an arbitrary file or binary on the device. To surface something outside it (e.g. `/sys/class/thermal/thermal_zone0/temp`), drop a one-line script into `scripts/` that reads it: the restriction is on what the *API* can point at, not on what a script you stage there may itself read. Scripts run with the server's privileges; keep the agent on a trusted LAN, as with the rest of the API.
+`scripts/` is the **only** folder a sensor can run anything from. That folder is hardcoded (no config field or API call can widen it), so a holder of the API key can never point a sensor at an arbitrary file or binary on the device. To surface something outside it (e.g. `/sys/class/thermal/thermal_zone0/temp`), drop a one-line script into `scripts/` that reads it: the restriction is on what the *API* can point at, not on what a script you stage there may itself read. Scripts run with the server's privileges; keep the agent on a trusted LAN, as with the rest of the API. Once a key holder can write scripts (see [Scripts](#scripts)), they can run any code the server's user can: lock writes with `write.lock` when you don't need them.
 
 Reading returns a clear message instead of failing when a script is missing or broken: `{"<name>": "script not found"}`, `{"<name>": "script failed or did not produce output"}` when it exits non-zero or prints nothing, `{"<name>": "script timed out"}` after the 15-second limit, and `{"<name>": "blocked: <reason>"}` when a sensor violates the name/argument rules (possible when sensors arrive via `/config/load` or an edited `config.json`; every read re-validates).
 
@@ -292,6 +292,95 @@ Because every sensor owns exactly one key in that merge, two sensors emitting th
 curl -H "Api-Key: your-secret-key" http://<pi-host-addr>:8314/sensor/read
 # → {"cpu_temp": 47.8, "status": "ok"}
 ```
+
+## Scripts
+
+List, read, write and run the files in `scripts/`, the same folder sensors run from.
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/script/list` | Every file in `scripts/`, plus whether writes are allowed |
+| `GET` | `/script/read/{name}` | One file's text |
+| `POST` | `/script/write/{name}` | Create or overwrite a file, or delete it |
+| `POST` | `/script/run/{name}` | Run a file and return its output and exit code |
+
+`{name}` is a **bare filename** of up to 32 characters, the same rule as a sensor's script: letters, digits, `.`, `_` and `-`, no leading dot or `-`, so no paths, no `..` and no subfolders (`400` otherwise). Subfolders of `scripts/` are never listed, read, written or run. A file that isn't there returns `404`.
+
+### Request Bodies
+
+#### `POST /script/write/{name}`
+
+```json
+{
+  "content": "echo 42\n"
+}
+```
+
+Or, to delete the file:
+
+```json
+{
+  "remove": true
+}
+```
+
+Writing an existing name replaces it. The new text is written to a temporary file and moved into place, so a run never sees half a script. A script can be up to about 16 KB (the request body limit).
+
+#### `POST /script/run/{name}`
+
+The body is optional:
+
+```json
+{
+  "args": ["21"]
+}
+```
+
+Arguments may contain letters and digits only.
+
+### Responses
+
+```bash
+curl -H "Api-Key: <key>" http://<pi-host-addr>:8314/script/list
+# → {"scripts": [{"name": "cpu-temp.sh", "size": 52, "modified": "2026-10-24 09:12:03"}], "write": "enabled"}
+
+curl -H "Api-Key: <key>" http://<pi-host-addr>:8314/script/read/cpu-temp.sh
+# → {"name": "cpu-temp.sh", "content": "..."}
+
+curl -X POST -H "Api-Key: <key>" -H "Content-Type: application/json" \
+  -d '{"content": "echo 42"}' http://<pi-host-addr>:8314/script/write/answer.sh
+# → {"name": "answer.sh", "size": 7}       (delete: {"name": "answer.sh", "status": "removed"} or "not found")
+
+curl -X POST -H "Api-Key: <key>" http://<pi-host-addr>:8314/script/run/answer.sh
+# → {"name": "answer.sh", "exit_code": 0, "output": "42"}
+```
+
+A run works like a sensor read: `sh scripts/<file> <args>`, or the agent's own Python for a `.py` file, with no shell parsing the arguments. `output` is the script's **stdout** as text (first 2 KB, trailing whitespace trimmed), never parsed as JSON. A script still running after 15 seconds is killed and the call returns `504` `{"error": "script timed out"}`.
+
+### Write protection
+
+`list`, `read` and `run` always work. `/script/write` (including a delete) returns `403` when:
+
+- the agent's `api_key` is still the shipped default `your-secret-key` (`"write": "default_key"` in the list), so set your own key first;
+- a file named **`write.lock`** is in `scripts/` (`"write": "locked"`). Its content doesn't matter. The lock covers `write.lock` too: `/script/write` can't change or delete it.
+
+A fresh install has no lock. To lock, write the file over the API:
+
+```bash
+curl -X POST -H "Api-Key: <key>" -H "Content-Type: application/json" -d '{"content": ""}' http://<pi-host-addr>:8314/script/write/write.lock
+```
+
+To unlock, remove it on the Pi (this is the path for the default curl install; adjust it if you installed elsewhere):
+
+```bash
+ssh <user>@<pi-host-addr> 'rm ~/pi-gpio-api/scripts/write.lock'
+```
+
+On the Pi itself, `./install.sh --unlock` in the `pi-gpio-api` folder does the same and installs nothing.
+
+The lock blocks writes over the API, not code. `/script/run` still works while locked, and a script in `scripts/` runs with the agent's privileges, so one that deletes files can remove `write.lock`. A lock keeps the folder read-only only if you trust the scripts already in it.
+
+`write.lock` shows up in `/script/list` like any other file, and running it returns `400`.
 
 ## Agent Setup
 
@@ -371,9 +460,11 @@ Error responses are JSON `{"error": ...}`, except 404 which has an empty body:
 |--------|------|------|
 | `400` | Bad write/config (e.g. writing to a pin configured as `input`/`vcc`/`gnd`, invalid value) | `{"error": "<reason>"}` |
 | `403` | Missing or wrong `Api-Key` header | `{"error": "Invalid or missing Api-Key header"}` |
+| `403` | `/script/write` refused (default key, or `write.lock` in place; see [Scripts](#write-protection)) | `{"error": "<reason>"}` |
 | `404` | Unknown pin/name, or unknown route | empty |
 | `413` | Request body over 16 KB | `{"error": "Request body too large"}`. Checked before authentication, so an oversized body is refused whatever key it carries. The largest real request is a full `/config/load` (every pin named, with sensors), which is well under it |
 | `422` | Request body fails validation | `{"error": [<validation error list>]}`. Special case: `GET /gpio/scan` off-Pi returns `{"agent": {...}, "error": "Platform does not support GPIOs"}` |
+| `504` | `/script/run` still running after 15 seconds (killed) | `{"error": "script timed out"}` |
 
 ## Webhooks
 
