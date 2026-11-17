@@ -41,7 +41,7 @@ except ModuleNotFoundError as e:
 
 from typing import Optional, Union, Literal, Dict, Any
 from contextlib import asynccontextmanager
-VERSION = "0.9.30p"  # agent software version (kept in lockstep with pico-gpio-api; the "p" marks the full version, lite.py has none); surfaced in /config/read
+VERSION = "0.9.31p"  # agent software version (kept in lockstep with pico-gpio-api; the "p" marks the full version, lite.py has none); surfaced in /config/read
 IS_PI = os.path.exists("/proc/device-tree/model")  # only real Pi hardware exposes this
 _PI_GPIO_PINS = [str(p) for p in range(2, 28)]  # usable BCM range (2-27)
 # GPIO 2 and 3 have fixed hardware pull-ups on all Pi boards.
@@ -357,7 +357,7 @@ class BridgesConfig(BaseModel):
     matter_key: Optional[str] = None
     homekit: Optional[str] = None
     homekit_key: Optional[str] = None
-    # homebridge-ctrlpi has its own slot, so it and homekit-bridge both receive every
+    # homebridge-ctrlpi has its own slot, so it and a standalone HomeKit bridge both receive every
     # event when a household runs both.
     homebridge: Optional[str] = None
     homebridge_key: Optional[str] = None

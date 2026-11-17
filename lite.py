@@ -25,7 +25,7 @@ except ModuleNotFoundError as e:
     print("  or use: run.sh to create/enable a virtual environment (venv) and start")
     raise SystemExit(1)
 
-VERSION = "0.9.30"  # agent software version (kept in lockstep with pico-gpio-api); surfaced in /config/read
+VERSION = "0.9.31"  # agent software version (kept in lockstep with pico-gpio-api); surfaced in /config/read
 IS_PI = os.path.exists("/proc/device-tree/model")  # only real Pi hardware exposes this
 _PI_GPIO_PINS = [str(p) for p in range(2, 28)]  # usable BCM range (2-27)
 # GPIO 2 and 3 have fixed hardware pull-ups on all Pi boards.
