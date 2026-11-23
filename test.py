@@ -648,6 +648,124 @@ class BasePiGpioApiTests:
         finally:
             requests.post(f"{self.base_url}/config/update", headers=self.headers, json={"name": name}, timeout=3)
 
+    def _wait_for_script_file(self, name, text, timeout=5):
+        """Waits until scripts/<name> holds `text` (a pin script runs in the background)"""
+        deadline = time.time() + timeout
+        content = None
+        while time.time() < deadline:
+            r = self._script("read", name)
+            if r.status_code == 200:
+                content = r.json()["content"]
+                if content == text:
+                    return content
+            time.sleep(0.1)
+        return content
+
+    def test_pin_script_config_and_validation(self):
+        """A pin's script is set, stored canonical, read back, cleared, and refused when it is not a plain filename"""
+        def cfg(pin, body):
+            return requests.post(f"{self.base_url}/gpio/config/{pin}", headers=self.headers, json=body, timeout=5)
+        def pin(n):
+            return requests.get(f"{self.base_url}/gpio/read/{n}", headers=self.headers, timeout=5).json()
+        try:
+            r = cfg(17, {"type": "output", "script": "On:  relay.sh   fast"})
+            self.assertEqual(r.status_code, 200, r.text)
+            self.assertEqual(r.json()["script"], "on:relay.sh fast")
+            self.assertEqual(pin(17)["script"], "on:relay.sh fast")
+            gpios = requests.get(f"{self.base_url}/config/read", headers=self.headers, timeout=5).json()["gpios"]
+            self.assertEqual(gpios["17"]["script"], "on:relay.sh fast")
+            self.assertEqual(cfg(17, {"script": "OFF: relay.sh"}).json()["script"], "off:relay.sh")
+            self.assertEqual(cfg(17, {"script": "relay.sh"}).json()["script"], "relay.sh")
+            # The same field on an input, and a number sent for it is stored as text
+            self.assertEqual(cfg(18, {"type": "input", "script": "on: relay.sh"}).json()["script"], "on:relay.sh")
+            self.assertEqual(cfg(18, {"script": 5}).json()["script"], "5")
+            # Not a bare filename, a path, bad arguments, a bare prefix, a long name: 400 and nothing changes
+            for bad in ("../x.sh", "sub/x.sh", ".hidden", "relay.sh a-b", "on:", "off: ", "a" * 33):
+                r = cfg(17, {"script": bad})
+                self.assertEqual(r.status_code, 400, bad)
+                self.assertEqual(pin(17)["script"], "relay.sh", bad)
+            # Cleared by "" or null, and gone from every read
+            for empty in ("", None):
+                cfg(17, {"script": "relay.sh"})
+                self.assertNotIn("script", cfg(17, {"script": empty}).json())
+                self.assertNotIn("script", pin(17))
+            # A pin that becomes vcc or gnd loses it
+            cfg(17, {"script": "relay.sh"})
+            self.assertNotIn("script", cfg(17, {"type": "vcc"}).json())
+            # /config/load keeps a valid one canonical and drops (not rejects) an invalid one
+            body = {"gpios": {"19": {"type": "output", "script": "ON: relay.sh"},
+                              "20": {"type": "output", "script": "../bad.sh"}}}
+            self.assertEqual(requests.post(f"{self.base_url}/config/load", headers=self.headers, json=body, timeout=5).status_code, 200)
+            gpios = requests.get(f"{self.base_url}/config/read", headers=self.headers, timeout=5).json()["gpios"]
+            self.assertEqual(gpios["19"]["script"], "on:relay.sh")
+            self.assertNotIn("script", gpios["20"])
+        finally:
+            requests.post(f"{self.base_url}/config/load", headers=self.headers, json={}, timeout=5)
+
+    def test_pin_script_runs_on_output_changes(self):
+        """An output's script runs when its value really changes: both ways with the value as the argument, or only on / off with none"""
+        marker, script = "test_ci_pin.log", "test_ci_pin.sh"
+        path = lambda n: os.path.join(self.sensor_dir, n)
+        def cfg(body):
+            r = requests.post(f"{self.base_url}/gpio/config/17", headers=self.headers, json=body, timeout=5)
+            self.assertEqual(r.status_code, 200, r.text)
+        def write(value):
+            r = requests.post(f"{self.base_url}/gpio/write/17", headers=self.headers, json={"value": value}, timeout=5)
+            self.assertEqual(r.status_code, 200, r.text)
+        def reset_marker():
+            self.assertEqual(self._script("write", marker, {"content": ""}).status_code, 200)
+        def arm(value):
+            # Saving an output again can reset its level (the mock does, gpiozero keeps it), which is
+            # a change too: so clear the script first, empty the marker, then set the script.
+            cfg({"script": ""})
+            reset_marker()
+            cfg({"script": value})
+        try:
+            # The script appends "<count> <args>" to the marker file next to it
+            src = 'echo "$# $*" >> "$(dirname "$0")/' + marker + '"\n'
+            self.assertEqual(self._script("write", script, {"content": src}).status_code, 200)
+            # No init: saving the pin again keeps its level (an init would reset it, which is a change too)
+            cfg({"type": "output"})
+            # No prefix: runs on 1 and on 0, with the value as its last argument; the same value again does nothing
+            arm(script)
+            write(1); write(1); write(0)
+            self.assertEqual(self._wait_for_script_file(marker, "1 1\n1 0\n"), "1 1\n1 0\n")
+            # Extra arguments come first, the value last
+            arm(script + " fast")
+            write(1)
+            self.assertEqual(self._wait_for_script_file(marker, "2 fast 1\n"), "2 fast 1\n")
+            # on: runs only when the pin goes to 1, and gets no value
+            arm("on:" + script)
+            write(0); write(1); write(0); write(1)
+            self.assertEqual(self._wait_for_script_file(marker, "0 \n0 \n"), "0 \n0 \n")
+            # off: runs only when it goes to 0
+            arm("off: " + script)
+            write(1); write(0)
+            self.assertEqual(self._wait_for_script_file(marker, "0 \n"), "0 \n")
+            # A pin with the script removed runs nothing
+            cfg({"script": ""})
+            reset_marker()
+            write(1); write(0)
+            time.sleep(0.5)
+            self.assertEqual(self._script("read", marker).json()["content"], "")
+        finally:
+            requests.post(f"{self.base_url}/gpio/config/17", headers=self.headers, json={"type": "remove"}, timeout=5)
+            for n in (script, marker):
+                if os.path.exists(path(n)):
+                    os.remove(path(n))
+
+    def test_pin_script_missing_file_is_skipped(self):
+        """A pin script whose file does not exist is accepted, and a change just logs a skip"""
+        r = requests.post(f"{self.base_url}/gpio/config/17", headers=self.headers,
+                          json={"type": "output", "init": 0, "script": "test_ci_no_such_script.sh"}, timeout=5)
+        try:
+            self.assertEqual(r.status_code, 200, r.text)
+            self.assertEqual(requests.post(f"{self.base_url}/gpio/write/17", headers=self.headers, json={"value": 1}, timeout=5).status_code, 200)
+            time.sleep(0.5)
+            self.assertEqual(requests.get(f"{self.base_url}/gpio/read/17", headers=self.headers, timeout=5).json()["value"], 1)
+        finally:
+            requests.post(f"{self.base_url}/gpio/config/17", headers=self.headers, json={"type": "remove"}, timeout=5)
+
 
 class TestPiGpioApiLite(BasePiGpioApiTests, unittest.TestCase):
     """Test suite running against lite.py (zero fastapi/pydantic dependencies)"""
@@ -845,6 +963,193 @@ class TestScanShapeMain(BaseScanShapeTests, unittest.TestCase):
     SERVER_FILE = "main.py"
 
 
+class BasePinScriptTests:
+    """Pin script triggers, run inside the server module itself so an input edge can be simulated
+    (the mock input never fires its callbacks). The runner's put() is replaced by a recorder, so
+    these check what would run and with which arguments; the real runs are in the API tests."""
+    SERVER_FILE = None
+
+    @classmethod
+    def setUpClass(cls):
+        cls.old_cwd = os.getcwd()
+        cls.temp_dir = tempfile.mkdtemp()
+        os.chdir(cls.temp_dir)
+        path = os.path.join(_script_dir, cls.SERVER_FILE)
+        spec = importlib.util.spec_from_file_location("pins_" + cls.SERVER_FILE.replace(".", "_"), path)
+        cls.mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.mod)
+        cls.manager = cls.mod.manager
+
+    @classmethod
+    def tearDownClass(cls):
+        os.chdir(cls.old_cwd)
+        shutil.rmtree(cls.temp_dir, ignore_errors=True)
+
+    def setUp(self):
+        self.calls, self.pins = [], set()
+        self.manager._script_runner.put = lambda gpio, name, args: self.calls.append((gpio, name, list(args)))
+        self.manager._last_edge.clear()
+        self.addCleanup(self._remove_pins)
+
+    def _remove_pins(self):
+        for gpio in self.pins:
+            self.manager.config_pin(gpio, {"type": "remove"})
+        self.manager.status.clear()
+
+    def cfg(self, gpio, **update):
+        self.pins.add(str(gpio))
+        return self.manager.config_pin(str(gpio), update)
+
+    def test_output_runs_on_a_real_change_only(self):
+        self.cfg(17, type="output", init=0, script="relay.sh")
+        self.manager.write_pin("17", 1)
+        self.manager.write_pin("17", 1)   # already 1: nothing
+        self.manager.write_pin("17", 0)
+        self.assertEqual(self.calls, [("17", "relay.sh", ["1"]), ("17", "relay.sh", ["0"])])
+
+    def test_on_and_off_prefixes_run_one_way_and_send_no_value(self):
+        self.cfg(17, type="output", init=0, script="on: relay.sh fast")
+        self.manager.write_pin("17", 1)
+        self.manager.write_pin("17", 0)
+        self.assertEqual(self.calls, [("17", "relay.sh", ["fast"])])
+        self.calls.clear()
+        self.cfg(17, script="off:relay.sh")
+        self.manager.write_pin("17", 1)
+        self.manager.write_pin("17", 0)
+        self.assertEqual(self.calls, [("17", "relay.sh", [])])
+
+    def test_duration_revert_runs_the_script(self):
+        self.cfg(17, type="output", init=0, script="relay.sh")
+        self.manager.write_pin("17", 1, 0.3)
+        time.sleep(0.8)
+        self.assertEqual(self.calls, [("17", "relay.sh", ["1"]), ("17", "relay.sh", ["0"])])
+
+    def test_output_at_boot_starts_from_what_the_agent_knows(self):
+        # An explicit init of 1 on a pin that powers on LOW is a change to on
+        self.cfg(18, type="output", init=1, script="on:relay.sh")
+        self.assertEqual(self.calls, [("18", "relay.sh", [])])
+        self.calls.clear()
+        # init "last" restores the saved status: that is not a change, so nothing runs
+        self.manager.status["19"] = 1
+        self.cfg(19, type="output", init="last", script="on:relay.sh")
+        self.assertEqual(self.manager.get_pin_info("19")["value"], 1)
+        self.assertEqual(self.calls, [])
+        # init "last" with no saved value starts from 0, and a write to 1 is then a change
+        self.cfg(20, type="output", init="last", script="on:relay.sh")
+        self.assertEqual(self.calls, [])
+        self.manager.write_pin("20", 1)
+        self.assertEqual(self.calls, [("20", "relay.sh", [])])
+
+    def test_input_edge_runs_the_script_without_a_watch(self):
+        self.cfg(21, type="input", script="relay.sh")
+        dev = self.manager.devices["21"]
+        self.assertFalse(self.manager.watches.get("21"))
+        self.assertIsNotNone(dev.when_activated)   # the edges are heard for the script alone
+        self.assertEqual(self.calls, [])           # configuring the pin changes nothing
+        hooks = []
+        self.manager._trigger_webhook = lambda gpio: hooks.append(gpio)
+        try:
+            dev.value = 1                          # pulled low: logical 0
+            self.manager._on_edge("21")
+            self.manager._last_edge.clear()
+            dev.value = 0
+            self.manager._on_edge("21")
+        finally:
+            del self.manager._trigger_webhook
+        self.assertEqual(self.calls, [("21", "relay.sh", ["0"]), ("21", "relay.sh", ["1"])])
+        self.assertEqual(hooks, [])                # no watch: no webhook
+
+    def test_input_is_compared_with_its_init_at_boot(self):
+        self.cfg(22, type="input", init=0, script="on:relay.sh")   # idle reads 1, init says 0
+        self.assertEqual(self.calls, [("22", "relay.sh", [])])
+        self.calls.clear()
+        self.cfg(23, type="input", init=1, script="on:relay.sh")   # as expected: nothing
+        self.assertEqual(self.calls, [])
+
+    def test_a_debounced_edge_is_read_again(self):
+        self.cfg(21, type="input", script="relay.sh")
+        dev = self.manager.devices["21"]
+        dev.value = 1
+        self.manager._on_edge("21")                # goes to 0: runs
+        dev.value = 0
+        self.manager._on_edge("21")                # back to 1 inside the debounce window: dropped now
+        self.assertEqual(len(self.calls), 1)
+        time.sleep(0.6)                            # and read again after it
+        self.assertEqual(self.calls, [("21", "relay.sh", ["0"]), ("21", "relay.sh", ["1"])])
+
+    def test_a_script_set_on_an_existing_pin_rebases_its_start_point(self):
+        seen = []
+        real = self.manager._init_pin
+        def spy(gpio, conf, **kw):
+            seen.append(kw.get("rebase"))
+            return real(gpio, conf, **kw)
+        self.manager._init_pin = spy
+        try:
+            self.cfg(21, type="input", script="relay.py")   # a new pin: first seen, nothing to rebase
+            self.cfg(21, script="other.py")                 # a script set on a pin that already has a value
+            self.cfg(21, pullup="down")                     # no script in the update
+        finally:
+            del self.manager._init_pin
+        self.assertEqual(seen, [False, True, False])
+
+    def test_setting_a_script_with_a_new_pull_is_not_run_by_the_setup(self):
+        # The agent's reading of an input depends on its pull. On a real Pi the old device read through the
+        # new pull gives the wrong value; here the old device is made to misread, as it does there.
+        self.cfg(21, type="input", pullup="down")
+        old = self.manager.devices["21"]
+        real = self.manager.get_pin_info
+        def through_the_old_device(gpio, show_level=False):
+            info = real(gpio, show_level)
+            if self.manager.devices.get(gpio) is old:
+                info["value"] = 1 - info["value"]
+            return info
+        self.manager.get_pin_info = through_the_old_device
+        try:
+            self.cfg(21, pullup="up", script="relay.py")
+        finally:
+            del self.manager.get_pin_info
+        self.assertEqual(self.calls, [])           # setting the script ran nothing
+
+    def test_runner_keeps_order_and_drops_the_oldest_when_full(self):
+        mod, ran = self.mod, []
+        started, release = threading.Event(), threading.Event()
+        def fake_run(name, body):
+            ran.append(body["args"])
+            started.set()
+            release.wait(5)
+            return {"exit_code": 0}
+        real_run, real_max = mod.run_script, mod.PinScriptRunner.QUEUE_MAX
+        mod.run_script, mod.PinScriptRunner.QUEUE_MAX = fake_run, 2
+        try:
+            runner = mod.PinScriptRunner()
+            runner.put("5", "a.sh", ["1"])
+            self.assertTrue(started.wait(5))
+            for value in ("2", "3", "4"):          # the queue holds 2: "2" is dropped
+                runner.put("5", "a.sh", [value])
+            release.set()
+            deadline = time.time() + 5
+            while len(ran) < 3 and time.time() < deadline:
+                time.sleep(0.05)
+            time.sleep(0.2)
+        finally:
+            mod.run_script, mod.PinScriptRunner.QUEUE_MAX = real_run, real_max
+        self.assertEqual(ran, [["1"], ["3"], ["4"]])
+
+    def test_runner_skips_a_missing_script(self):
+        self.mod.PinScriptRunner._run("5", "test_ci_no_such_script.sh", ["1"])
+        with open("agent.log") as f:
+            self.assertIn("skipped test_ci_no_such_script.sh 1", f.read())
+
+
+class TestPinScriptsLite(BasePinScriptTests, unittest.TestCase):
+    SERVER_FILE = "lite.py"
+
+
+@unittest.skipIf(not HAS_FASTAPI_AND_PYDANTIC, "fastapi and pydantic not installed; skipping main.py")
+class TestPinScriptsMain(BasePinScriptTests, unittest.TestCase):
+    SERVER_FILE = "main.py"
+
+
 if __name__ == "__main__":
     suite = unittest.TestSuite()
 
@@ -852,12 +1157,14 @@ if __name__ == "__main__":
     suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(TestPiGpioApiLite))
     suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(TestWebhookSenderLite))
     suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(TestScanShapeLite))
+    suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(TestPinScriptsLite))
 
     # 2. Then check fastapi and pydantic, if both available, run against main.py
     if HAS_FASTAPI_AND_PYDANTIC:
         suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(TestPiGpioApiMain))
         suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(TestWebhookSenderMain))
         suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(TestScanShapeMain))
+        suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(TestPinScriptsMain))
     else:
         print("Note: fastapi and/or pydantic not installed; skipping main.py tests.")
 

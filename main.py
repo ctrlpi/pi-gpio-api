@@ -41,7 +41,7 @@ except ModuleNotFoundError as e:
 
 from typing import Optional, Union, Literal, Dict, Any
 from contextlib import asynccontextmanager
-VERSION = "0.9.31p"  # agent software version (kept in lockstep with pico-gpio-api; the "p" marks the full version, lite.py has none); surfaced in /config/read
+VERSION = "0.9.50p"  # agent software version (kept in lockstep with pico-gpio-api; the "p" marks the full version, lite.py has none); surfaced in /config/read
 IS_PI = os.path.exists("/proc/device-tree/model")  # only real Pi hardware exposes this
 _PI_GPIO_PINS = [str(p) for p in range(2, 28)]  # usable BCM range (2-27)
 # GPIO 2 and 3 have fixed hardware pull-ups on all Pi boards.
@@ -291,6 +291,7 @@ class PinConfig(BaseModel):
     max: Optional[float] = Field(None, description="Max duration in seconds")
     reversed: Optional[bool] = False
     watched: Optional[bool] = None
+    script: Optional[str] = None
 
     @field_validator("type", "pullup", mode="before")
     @classmethod
@@ -333,6 +334,7 @@ class PinInfo(BaseModel):
     reversed: Optional[bool] = None
     duration: Optional[float] = None
     watched: Optional[bool] = None
+    script: Optional[str] = None
 
 # A named sensor: runs a script from the agent's scripts/ folder and returns its
 # stdout. `script` is "<script-file> [args...]" (see _validate_sensor_script).
@@ -479,7 +481,7 @@ def _text_fields(out):
     for group in ("notifications", "bridges"):
         if isinstance(out.get(group), dict):
             out[group] = {f: _as_text(v) for f, v in out[group].items()}
-    for section, field in (("gpios", "name"), ("sensors", "script")):
+    for section, field in (("gpios", "name"), ("gpios", "script"), ("sensors", "script")):
         entries = out.get(section)
         for entry in (entries.values() if isinstance(entries, dict) else ()):
             if isinstance(entry, dict) and field in entry:
@@ -634,6 +636,45 @@ def run_script(name: str, body: dict) -> dict:
         raise ScriptError(504, "script timed out")
     log_to_file(f"[Script] {name} run, exit code {proc.returncode}")
     return {"name": name, "exit_code": proc.returncode, "output": stdout[:SCRIPT_OUTPUT_CAP].rstrip()}
+
+
+# --- Pin scripts (a pin's `script`: run when the pin's value changes) ---
+# "[on:|off:]<file> [args]". `on:` runs only when the pin goes to 1, `off:` only when it goes
+# to 0 (neither adds the value to the arguments); with no prefix it runs on both and gets
+# the new value, 1 or 0, as its last argument. Stored in the canonical form: no space after
+# the prefix, single spaces between words. The file is a bare filename from scripts/ (the
+# sensor rule); it may be missing when set and is then skipped (and logged) when a run is due.
+
+_PIN_SCRIPT_PREFIX_RE = re.compile(r"(on|off)\s*:\s*", re.IGNORECASE)
+
+def _split_pin_script(script):
+    """Returns (mode, [file, *args]): mode is "on", "off" or None."""
+    text = (script or "").strip()
+    mode = None
+    m = _PIN_SCRIPT_PREFIX_RE.match(text)
+    if m:
+        mode, text = m.group(1).lower(), text[m.end():]
+    return mode, text.split()
+
+def _validate_pin_script(script) -> Optional[str]:
+    """Returns an error string if `script` isn't a valid pin script, else None. Empty is valid: no script."""
+    mode, tokens = _split_pin_script(script)
+    if not tokens:
+        return "script needs a filename after on: or off:" if (script or "").strip() else None
+    if not _SCRIPT_NAME_RE.fullmatch(tokens[0]):
+        return "script must be a bare filename in the scripts folder"
+    if len(tokens[0]) > SCRIPT_NAME_MAX:
+        return f"script name over {SCRIPT_NAME_MAX} characters"
+    if any(not re.fullmatch(r"[A-Za-z0-9]+", a) for a in tokens[1:]):
+        return "script args must be letters and digits only"
+    return None
+
+def _canonical_pin_script(script) -> Optional[str]:
+    """The stored form of a valid pin script, or None for no script."""
+    mode, tokens = _split_pin_script(script)
+    if not tokens:
+        return None
+    return (f"{mode}:" if mode else "") + " ".join(tokens)
 
 
 # --- Logging ---
@@ -906,9 +947,57 @@ class WebhookSender:
             target.put(payload, headers)
 
 
+# Runs the pin scripts. One ordered queue per pin, so a pin's runs never overlap and keep their
+# order (an on and an off must not swap); a full queue drops its oldest run, logged. The
+# worker thread of a pin exits when its queue is empty. A missing script is skipped and logged.
+class PinScriptRunner:
+    QUEUE_MAX = 20
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._queues: Dict[str, list] = {}
+
+    def put(self, gpio: str, name: str, args: list):
+        with self._lock:
+            queue = self._queues.get(gpio)
+            start = queue is None
+            if start:
+                queue = self._queues[gpio] = []
+            if len(queue) >= self.QUEUE_MAX:
+                queue.pop(0)
+                log_to_file(f"[Script] GPIO {gpio} queue full, dropped the oldest run")
+            queue.append((name, args))
+        if start:
+            threading.Thread(target=self._drain, args=(gpio,), daemon=True).start()
+
+    def _drain(self, gpio: str):
+        while True:
+            with self._lock:
+                queue = self._queues.get(gpio)
+                if not queue:
+                    self._queues.pop(gpio, None)
+                    return
+                name, args = queue.pop(0)
+            self._run(gpio, name, args)
+
+    @staticmethod
+    def _run(gpio: str, name: str, args: list):
+        label = " ".join([name, *args])
+        try:
+            result = run_script(name, {"args": args})
+            log_to_file(f"[Script] GPIO {gpio} ran {label}, exit code {result['exit_code']}")
+        except ScriptError as e:
+            log_to_file(f"[Script] GPIO {gpio} skipped {label}: {e}")
+        except Exception as e:
+            log_to_file(f"[Script] GPIO {gpio} failed {label}: {e}")
+
+
 class GPIOManager:
     def __init__(self):
         self._lock = threading.RLock()
+        self._script_runner = PinScriptRunner()
+        self._script_last: Dict[str, int] = {}   # gpio -> last value the pin scripts have seen (change detection)
+        self._rechecks: set = set()              # gpios with a debounced edge waiting to be re-read
         self._webhook_sender = WebhookSender(self.WEBHOOK_RETRIES, self.WEBHOOK_RETRY_DELAY)
         self._revert_token: Dict[str, int] = {}  # gpio -> int; bumped on write/config to cancel a pending revert
         self._last_edge: Dict[str, float] = {}   # gpio -> monotonic time of last edge webhook (debounce)
@@ -944,6 +1033,18 @@ class GPIOManager:
                 pin_data["pullup"] = "up"
             if pin_data.get("watched") is not True:
                 pin_data.pop("watched", None)
+            # A pin script belongs to inputs and outputs and is stored canonical; one that is
+            # not valid text is dropped (and logged) rather than failing the whole config.
+            if "script" in pin_data:
+                script = _as_text(pin_data["script"])
+                err = _validate_pin_script(script) if isinstance(script, str) else "script must be text"
+                canon = None if err else _canonical_pin_script(script)
+                if err:
+                    log_to_file(f"[Config] GPIO {gpio} script ignored: {err}")
+                if canon and _norm_str(pin_data.get("type")) not in ("vcc", "gnd"):
+                    pin_data["script"] = canon
+                else:
+                    pin_data.pop("script", None)
         # Clamp log_days to 0-30 here too (/config/load and hand edits skip the API check):
         # a negative value would make every hourly cleanup erase the whole log.
         settings = data.get("settings")
@@ -996,7 +1097,8 @@ class GPIOManager:
     # Brings up the gpiozero device for a pin per its type/init/watch settings, retrying
     # briefly. `default_new_output_to_zero` (set by config_pin()): a new output with no
     # init starts LOW; an existing output keeps its level.
-    def _init_pin(self, gpio: str, pin_conf, default_new_output_to_zero: bool = False):
+    def _init_pin(self, gpio: str, pin_conf, default_new_output_to_zero: bool = False, rebase: bool = False):
+        prev = self._script_last.get(gpio)   # None the first time this run of the agent sees the pin
         for attempt in range(5):
             try:
                 pin_type = pin_conf.type
@@ -1034,10 +1136,28 @@ class GPIOManager:
                     self._apply_watch(gpio)
                 elif self.watches.pop(gpio, None):
                     # Unwatching: _setup_input above re-attached the edge callbacks, so
-                    # detach them now or webhooks keep firing.
+                    # detach them now or webhooks keep firing (a pin script still needs them).
                     dev = self.devices.get(gpio)
-                    if isinstance(dev, DigitalInputDevice):
+                    if isinstance(dev, DigitalInputDevice) and not pin_conf.script:
                         dev.when_activated = dev.when_deactivated = None
+                # Pin scripts: what counts as the pin's previous value when it is first seen is what the
+                # agent actually knows. An output restored with init "last" starts from the saved status,
+                # so restoring it changes nothing; an output with any other init starts from the
+                # power-on level, 0. An input is compared with its init (or the saved status), like the webhook.
+                if pin_type in ("vcc", "gnd"):
+                    self._script_last.pop(gpio, None)
+                elif gpio in self.devices:
+                    new = self.get_pin_info(gpio)["value"]
+                    if prev is None:
+                        if pin_type == "output":
+                            saved = self.status.get(gpio) if init == "last" else None
+                            prev = 0 if saved is None else saved
+                        else:
+                            ref = init if init != "last" else self.status.get(gpio)
+                            prev = new if ref is None else ref
+                    if rebase:
+                        prev = new   # a script set now is measured from the pin as it reads after this setup
+                    self._script_event(gpio, new, prev)
                 break
             except Exception as e:
                 if attempt == 4:
@@ -1077,13 +1197,13 @@ class GPIOManager:
         if gpio in _PI_FIXED_PULLUP_PINS: pull = True
         kwargs = {"active_state": True} if pull is None else {}
         self.devices[gpio] = DigitalInputDevice(int(gpio), pull_up=pull, bounce_time=0.05, **kwargs)
-        if self.watches.get(gpio): self._apply_watch(gpio)
+        if self._wants_edges(gpio): self._apply_watch(gpio)
 
     # Closing an input tears down lgpio's one shared edge registration, silencing every
     # other watched input; recreating their devices restores it. Used where an input is
     # closed without a replacement (_setup_input recreates on its own).
     def _rearm_watches(self, exclude: str):
-        for gpio in list(self.watches):
+        for gpio in [g for g in self.config.gpios if self._wants_edges(g)] + [g for g in self.watches if g not in self.config.gpios]:
             if gpio == exclude or not isinstance(self.devices.get(gpio), DigitalInputDevice):
                 continue
             conf = self.config.gpios.get(gpio)
@@ -1137,7 +1257,8 @@ class GPIOManager:
             name=conf.name, init=conf.init,
             pullup=conf.pullup if pin_type == "input" else None,
             max=conf.max, reversed=False if pin_type in ("vcc", "gnd") else conf.reversed,
-            watched=True if self.watches.get(gpio) else None
+            watched=True if self.watches.get(gpio) else None,
+            script=conf.script if pin_type in ("input", "output") else None
         )
         return info.model_dump(exclude_none=True)
 
@@ -1166,6 +1287,7 @@ class GPIOManager:
                 raise ValueError(f"Pin {name_or_gpio} is configured as {conf.type} and cannot be written")
             self._setup_output(gpio, conf.reversed)
             dev = self.devices[gpio]
+            self._script_last[gpio] = 0   # a new output starts LOW
             # pullup is input-only; clear the model's default "up" so an auto-created output
             # (or one promoted from a prior input) doesn't carry a meaningless pullup.
             if gpio not in self.config.gpios:
@@ -1201,6 +1323,7 @@ class GPIOManager:
         self._save_status()
         if self.watches.get(gpio):
             self._trigger_webhook(gpio)
+        self._script_changed(gpio)
 
         # The pin's configured `max` caps (and, if no duration was given, supplies) the duration
         effective_duration = duration
@@ -1224,6 +1347,7 @@ class GPIOManager:
                         self._save_status()
                         if self.watches.get(g):
                             self._trigger_webhook(g)
+                        self._script_changed(g)
                     except Exception:
                         pass
             threading.Thread(target=revert, daemon=True).start()
@@ -1235,12 +1359,23 @@ class GPIOManager:
             raise ValueError(f"GPIO number required, got: {name_or_gpio}")
         gpio = name_or_gpio
         self._require_valid_gpio(gpio)
+        # A pin script is checked here for a 400 with the reason, and stored canonical;
+        # an empty one (or null) clears it.
+        if "script" in update:
+            raw = _as_text(update["script"])
+            if raw is not None and not isinstance(raw, str):
+                raise ValueError("script must be text")
+            err = _validate_pin_script(raw)
+            if err:
+                raise ValueError(err)
+            update["script"] = _canonical_pin_script(raw)
         # Reconfiguring a pin supersedes any pending duration-revert for it.
         self._revert_token[gpio] = self._revert_token.get(gpio, 0) + 1
 
         # type="remove" deletes the pin's config/device/watch entirely
         if update.get("type") == "remove":
             self.watches.pop(gpio, None)
+            self._script_last.pop(gpio, None)
             # close() releases the pin, so it stops driving. Don't create a temporary
             # input here: closing an input breaks the shared edge registration (see
             # _rearm_watches).
@@ -1272,6 +1407,7 @@ class GPIOManager:
             current.pullup = None
             current.reversed = False
             current.watched = None
+            current.script = None
             self.watches.pop(gpio, None)
         elif effective_type == "output":
             current.pullup = None
@@ -1288,9 +1424,15 @@ class GPIOManager:
         # a type change unless this call supplies a fresh one.
         if effective_type != original_type and "init" not in update:
             current.init = None
+        if effective_type != original_type:
+            self._script_last.pop(gpio, None)   # the pin's value means something else now
         self.config.gpios[gpio] = current
         self._save_config()
-        self._init_pin(gpio, current, default_new_output_to_zero=(effective_type == "output" and not was_output_before))
+        # A script set (or changed) on a pin that already has a value is measured from the pin as it reads
+        # once it is set up again (not from a reading through the old device, which a new pull or
+        # `reversed` can misread), so setting it never runs it for the state the pin is already in.
+        rebase = "script" in update and gpio in self.devices and effective_type == original_type
+        self._init_pin(gpio, current, default_new_output_to_zero=(effective_type == "output" and not was_output_before), rebase=rebase)
         log_to_file(f"[GPIO] GPIO {gpio} configured: {update}")
         return self.get_pin_info(gpio)
 
@@ -1513,6 +1655,7 @@ class GPIOManager:
             except: pass
         self.devices.clear()
         self.watches.clear()
+        self._script_last.clear()
         self.config = self._load_config()
         self._initialize_pins()
 
@@ -1572,11 +1715,59 @@ class GPIOManager:
         now = time.monotonic()
         last = self._last_edge.get(gpio)
         if last is not None and now - last < self.WEBHOOK_MIN_INTERVAL:
+            self._schedule_recheck(gpio)
             return
         self._last_edge[gpio] = now
-        self._trigger_webhook(gpio)
+        if self.watches.get(gpio):
+            self._trigger_webhook(gpio)
+        self._script_changed(gpio)
 
-    # Wires an input pin's edge callbacks to fire the webhook on every state change
+    # An edge dropped by the debounce still matters to a pin script: after the window the pin
+    # is read once more, and the script runs if its value now differs from the last one seen.
+    def _schedule_recheck(self, gpio: str):
+        conf = self.config.gpios.get(gpio)
+        if not (conf and conf.script) or gpio in self._rechecks:
+            return
+        self._rechecks.add(gpio)
+        timer = threading.Timer(self.WEBHOOK_MIN_INTERVAL, self._recheck, args=(gpio,))
+        timer.daemon = True
+        timer.start()
+
+    @_locked
+    def _recheck(self, gpio: str):
+        self._rechecks.discard(gpio)
+        if gpio in self.devices:
+            self._script_changed(gpio)
+
+    # The pin's current value goes through the pin scripts' change detection.
+    @_locked
+    def _script_changed(self, gpio: str):
+        self._script_event(gpio, self.get_pin_info(gpio)["value"])
+
+    # Records `new` as the pin's value and, when it really changed from `old` (default: the last
+    # value seen) and the pin has a script, queues the run: on: only for 1, off: only for 0,
+    # and with no prefix both, with the new value as the last argument.
+    @_locked
+    def _script_event(self, gpio: str, new: int, old: Optional[int] = None):
+        if old is None:
+            old = self._script_last.get(gpio)
+        self._script_last[gpio] = new
+        if old is None or old == new:
+            return
+        conf = self.config.gpios.get(gpio)
+        if not conf or not conf.script:
+            return
+        mode, tokens = _split_pin_script(conf.script)
+        if (mode == "on" and new != 1) or (mode == "off" and new != 0):
+            return
+        self._script_runner.put(gpio, tokens[0], tokens[1:] + ([] if mode else [str(new)]))
+
+    # Pins whose edges must be heard: watched ones (webhook) and ones with a script.
+    def _wants_edges(self, gpio: str) -> bool:
+        conf = self.config.gpios.get(gpio)
+        return bool(self.watches.get(gpio) or (conf and conf.script))
+
+    # Wires an input pin's edge callbacks to fire the webhook and the pin script on every state change
     def _apply_watch(self, gpio: str):
         dev = self.devices.get(gpio)
         if isinstance(dev, DigitalInputDevice):

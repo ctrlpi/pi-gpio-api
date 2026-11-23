@@ -1,7 +1,7 @@
 # Raspberry Pi GPIO API
 
 [![Platform: Raspberry Pi](https://img.shields.io/badge/platform-Raspberry%20Pi-006400.svg)](#install-on-your-pi)
-[![Version 0.9.31](https://img.shields.io/badge/version-0.9.31-blue.svg)](https://github.com/ctrlpi/pi-gpio-api/tags)
+[![Version 0.9.50](https://img.shields.io/badge/version-0.9.50-blue.svg)](https://github.com/ctrlpi/pi-gpio-api/tags)
 [![Python 3.9+](https://img.shields.io/badge/python-3.9%2B-blue.svg)](https://www.python.org/)
 [![Auth: Api-Key](https://img.shields.io/badge/auth-Api--Key-orange.svg)](#authentication)
 [![License: MIT](https://img.shields.io/badge/license-MIT-188038.svg)](LICENSE)
@@ -245,6 +245,7 @@ Writing to an **unconfigured** pin auto-configures it as an output first. A pin 
 | `max` | float (seconds) | Maximum pulse duration (outputs only). Writes with a larger `duration` are clamped to it, and writes with **no** `duration` use it as the duration (see `POST /gpio/write` above). Cleared automatically when type is set to `input` or when type is set to `output` if the value is `0` or unset. |
 | `reversed` | boolean | Inverts the logical value. **Output**: writes the boolean flip to the physical GPIO pin (physical HIGH = logical 0). **Input**: flips the reported value. Cleared automatically when type is set to `vcc` or `gnd`. |
 | `watched` | boolean | `true` to send a webhook on every write (outputs) or state change (inputs); `false` to stop. Cleared automatically when type is set to `vcc` or `gnd`. Webhooks are only sent when a `webhook_url` is configured. With none set, each watched event is recorded in the agent log instead (see [Webhooks](#webhooks)). |
+| `script` | string | A script from the agent's `scripts/` folder to run when the pin's value changes (inputs and outputs, agent 0.9.50 or later): `[on:\|off:]<file> [args]`. `on:` runs it only when the pin goes to `1`, `off:` only when it goes to `0`, and neither passes the value; with no prefix it runs on both and gets the new value, `1` or `0`, as its last argument. A space after the prefix is accepted, and the agent stores it without. It runs only on a real change of the logical value: an input edge, a write, a `duration` revert, or a boot or reconfiguration that changes the level (an output restored with `init: "last"` starts from its saved value, any other output from `0`, an input is compared with its `init`). It does not need `watched`. A file that is missing is skipped and logged. `""` or `null` clears it, and it is cleared automatically when type is set to `vcc` or `gnd`. It runs like `/script/run` (same 15 second limit), queued per pin in order (20 at most, the oldest dropped and logged), and never holds up the API. |
 
 ## Sensors
 
